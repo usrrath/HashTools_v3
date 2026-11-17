@@ -1,67 +1,95 @@
-"""External-tool physical RAM acquisition for Windows x64, Linux x64 and macOS Intel.
+"""External-tool physical RAM acquisition (FTK-Imager-style "Capture Memory") for
+Windows x64 (WinPmem mini) and Linux x86_64 / aarch64 (AVML).
 
-Only a user-installed, trusted executable discovered on PATH is used. No drivers or
-acquisition binaries are bundled. An acquisition is reported as successful only when
-the tool exits with status 0 and a nonempty image exists; the image is then hashed
-read-only. Partial images and tool logs are kept on failure or cancellation and are
-never marked as validated.
+Only a user-supplied, trusted executable is used. No drivers or acquisition binaries are
+bundled. An acquisition is reported as successful only when the tool exits with status 0,
+a nonempty image exists, and the image has been hashed. Partial images, logs and a status
+record are kept on failure or cancellation and are never marked as validated.
+
+What this adds over a plain "run the tool, then hash" flow
+---------------------------------------------------------
+* The image is hashed *while it is being written* (``TailHasher``), so the long
+  hash-after-capture wait disappears.
+* Optional verification re-reads the finished image and confirms the streamed SHA-256, so
+  the reported digests describe the bytes actually at rest.
+* Determinate progress (percent, MiB/s, ETA) instead of an indeterminate bar.
+* Per-image sidecars (``<image>.sha256/.md5/.sha1``, ``.metadata.json``, ``.summary.txt``)
+  so several captures can live in one folder; the executable's own SHA-256 is recorded.
+* Pre-flight checks that FTK-style imaging needs: FAT32 4 GiB file limit, free space,
+  and a warning when the image is written to the system volume being acquired.
+* A failed or cancelled capture still leaves a ``failed``/``cancelled`` status record.
 """
 from __future__ import annotations
 
-import hashlib
-import ctypes
 import json
-from datetime import datetime, timezone
 import os
 import platform
-import sys
 import shutil
 import signal
 import subprocess
+import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 
 import psutil
 
 from config import settings
+from services.memory_hashing import (
+    DEFAULT_ALGORITHMS, HASH_ALGORITHMS, RateMeter, TailHasher, format_bytes, format_eta,
+    hash_file, normalise_algorithms,
+)
 
 GiB = 1024 ** 3
+MiB = 1024 ** 2
 IMAGE_SUFFIXES = ('.mem', '.raw', '.lime')
 # An image far smaller than installed RAM usually means an incomplete acquisition.
 MIN_EXPECTED_FRACTION = 0.5
+# Images are a little larger than RAM on some tools (headers / LiME segment records).
+FREE_SPACE_MARGIN = 1.02
+FAT_LIMIT = 4 * GiB - 1
+_FAT_TYPES = {'fat', 'fat32', 'vfat', 'msdos'}
 _SIGKILL = getattr(signal, 'SIGKILL', signal.SIGTERM)
-# Read window for image hashing. Measured on single-CPU hardware: 1-8 MiB are equivalent
-# and 16 MiB is ~9% slower, so the BLAKE3-tuned HASH_CHUNK_SIZE is deliberately not reused.
-HASH_WINDOW = 4 * 1024 * 1024
 
 
 class UnsupportedCapture(RuntimeError):
     pass
 
 
+# The only WinPmem build HashTools runs: the mini x64 executable, invoked as
+# ``winpmem_mini_x64.exe <output>`` (for example ``winpmem_mini_x64.exe physmem.raw``).
+# Other WinPmem builds and syntaxes (rc2, go-winpmem, legacy ``-o``) are deliberately not run.
+WINPMEM_BINARY = 'winpmem_mini_x64.exe'
+
+
 # Command templates are kept in one table so each tool's syntax is visible in one place.
-# Confirm the exact syntax of the build you install: these are not verified here.
 TOOLS = {
     'WinPmem': dict(
-        binary='winpmem.exe', os='Windows', arch=('amd64', 'x86_64'),
-        args=lambda exe, dest: [exe, '-o', dest],
+        binary=WINPMEM_BINARY, binaries=(WINPMEM_BINARY,), patterns=(),
+        os='Windows', arch=('amd64', 'x86_64'),
+        args=lambda exe, dest: [exe, dest],          # winpmem_mini_x64.exe <output>
         privilege='Administrator',
         ready='Ready (verify build and privileges before acquisition)',
     ),
     'AVML': dict(
-        binary='avml', os='Linux', arch=('x86_64', 'amd64'),
+        binary='avml', binaries=('avml',), patterns=(),
+        os='Linux', arch=('x86_64', 'amd64', 'aarch64', 'arm64'),
         args=lambda exe, dest: [exe, dest],          # LiME output, uncompressed
         privilege='root',
         ready='Ready (verify build and privileges before acquisition)',
+        ready_by_arch={'aarch64': 'Ready on aarch64: confirm your AVML build supports this architecture',
+                       'arm64': 'Ready on aarch64: confirm your AVML build supports this architecture'},
     ),
     # Historical OSXPMem is intentionally not executable here: its CLI and kernel
     # compatibility have not been verified for modern macOS.
     'OSXPmem': dict(
-        binary='osxpmem', os='Darwin', arch=(),
+        binary='osxpmem', binaries=('osxpmem',), patterns=(), os='Darwin', arch=(),
         args=None, privilege='root', ready='Unsupported: no verified macOS backend',
     ),
 }
+
+# Tools the examiner explicitly approved in this session ({name: absolute path}).
+_CUSTOM_TOOLS: dict = {}
 
 
 def native_architecture():
@@ -109,96 +137,87 @@ def is_elevated():
     return os.geteuid() == 0
 
 
-def _candidate_executables(binary):
-    """Find locally supplied acquisition binaries, including PyInstaller bundles."""
-    roots = [Path(sys.executable).resolve().parent]
+def local_tool_dirs():
+    """Folders searched, besides PATH, for a trusted tool shipped next to the application
+    (``<app>/tools``). The working directory is deliberately NOT searched."""
+    dirs = [Path(settings.BASE_DIR) / 'tools']
     if getattr(sys, 'frozen', False):
-        roots.append(Path(getattr(sys, '_MEIPASS', roots[0])))
-    else:
-        roots.append(Path(__file__).resolve().parents[1])
-    roots.extend([Path(os.environ.get('PROGRAMFILES', 'C:/Program Files')) / 'HashTools',
-                  Path('C:/ForensicTools/WinPmem')])
-    override = os.environ.get('HASHTOOLS_WINPMEM_PATH', '').strip()
-    candidates = [Path(override)] if override else []
-    for root in roots:
-        for subdir in ('', 'tools', 'tools/winpmem', 'bin'):
-            candidates.append(root / subdir / binary)
-    located = shutil.which(binary)
-    if located:
-        candidates.append(Path(located))
-    seen = set()
-    for candidate in candidates:
+        dirs.insert(0, Path(sys.executable).resolve().parent / 'tools')
+    return dirs
+
+
+def _find_tool(spec):
+    """Return ``(path, source)`` for the first executable found, else ``(None, None)``."""
+    for name in spec.get('binaries') or (spec['binary'],):
+        found = shutil.which(name)
+        if found:
+            return found, 'PATH'
+    for folder in local_tool_dirs():
         try:
-            resolved = candidate.expanduser().resolve()
-            if resolved not in seen and resolved.is_file():
-                seen.add(resolved)
-                yield str(resolved)
+            if not folder.is_dir():
+                continue
+            for name in spec.get('binaries', ()):
+                if (folder / name).is_file():
+                    return str(folder / name), 'tools folder'
+            for pattern in spec.get('patterns', ()):
+                for match in sorted(folder.glob(pattern)):
+                    if match.is_file():
+                        return str(match), 'tools folder'
         except OSError:
             continue
+    return None, None
 
 
-def _pe_machine(path):
-    """Read PE COFF Machine without executing the file."""
-    try:
-        with open(path, 'rb') as stream:
-            if stream.read(2) != b'MZ':
-                return None
-            stream.seek(0x3c)
-            offset = int.from_bytes(stream.read(4), 'little')
-            if offset < 64 or offset > 16 * 1024 * 1024:
-                return None
-            stream.seek(offset)
-            if stream.read(4) != b'PE\0\0':
-                return None
-            return int.from_bytes(stream.read(2), 'little')
-    except OSError:
-        return None
+def register_custom_tool(name, path):
+    """Approve a specific executable the examiner browsed to. Returns its SHA-256 so the UI
+    can show it for confirmation. The binary is still only run for a compatible OS/arch."""
+    spec = TOOLS.get(name)
+    if spec is None or spec['args'] is None:
+        raise UnsupportedCapture(f'{name} has no supported acquisition command')
+    system, arch = _system_arch()
+    if system != spec['os'] or arch not in spec['arch']:
+        raise UnsupportedCapture(_unsupported_reason(name, system, arch))
+    exe = Path(path).expanduser().resolve()
+    if not exe.is_file():
+        raise FileNotFoundError(f'Not a file: {exe}')
+    # The command syntax is fixed per binary name, so a renamed or different build is refused.
+    if exe.name.lower() not in {b.lower() for b in spec['binaries']}:
+        raise UnsupportedCapture(f'For {name} select the file named {" or ".join(spec["binaries"])}; '
+                                 f'got {exe.name}')
+    digest = hash_file(exe, ('sha256',))['sha256']
+    _CUSTOM_TOOLS[name] = str(exe)
+    return digest
+
+
+def clear_custom_tools():
+    _CUSTOM_TOOLS.clear()
 
 
 def detect_backends():
-    """Discover installed/bundled tools; do not execute or trust arbitrary downloads."""
+    """Return one status record per known tool. Cheap: safe to call on every user action."""
     system, arch = _system_arch()
     results = []
     for name, spec in TOOLS.items():
         compatible = system == spec['os'] and arch in spec['arch'] and spec['args'] is not None
-        candidates = list(_candidate_executables(spec['binary'])) if system == spec['os'] else []
-        path = candidates[0] if candidates else None
-        machine = _pe_machine(path) if path and system == 'Windows' else None
-        machine_ok = (machine == 0x8664) if name == 'WinPmem' and path else True
-        if not compatible:
-            reason = _unsupported_reason(name, system, arch)
-        elif not path:
-            reason = ('WinPmem not supplied. Bundle a verified compatible build in '
-                      'tools/winpmem or select a trusted local executable.') if name == 'WinPmem' else 'Acquisition tool not found on PATH'
-        elif not machine_ok:
-            reason = 'Executable is not a verified x64 PE binary (wrong architecture or invalid file)'
+        # Report the detected binary even when incompatible, but never execute it.
+        path, source = _find_tool(spec) if system == spec['os'] else (None, None)
+        if path is None and compatible and name in _CUSTOM_TOOLS and Path(_CUSTOM_TOOLS[name]).is_file():
+            path, source = _CUSTOM_TOOLS[name], 'user-approved'
+        if compatible and path:
+            reason = spec.get('ready_by_arch', {}).get(arch, spec['ready'])
+            if source and source != 'PATH':
+                reason += f' [{source}: {Path(path).name}]'
+        elif compatible:
+            reason = (f'Not installed: place {" or ".join(spec["binaries"])} on PATH or in the tools folder, '
+                      'or use Browse tool, then press Re-check tools')
         else:
-            reason = 'Executable located; driver compatibility and signature must be checked before acquisition'
-        results.append({'name': name, 'path': path, 'compatible': compatible,
-                        'ready': bool(path and compatible and machine_ok),
-                        'reason': reason, 'privilege': spec['privilege'],
-                        'machine': machine})
+            reason = _unsupported_reason(name, system, arch)
+        results.append({
+            'name': name, 'path': path, 'source': source, 'compatible': compatible,
+            'ready': bool(path and compatible), 'reason': reason,
+            'privilege': spec['privilege'],
+        })
     return results
-
-
-def request_administrator_restart():
-    """Ask Windows UAC to relaunch the same application. Never bypass UAC."""
-    if os.name != 'nt':
-        raise UnsupportedCapture('Administrator restart is supported on Windows only')
-    if is_elevated():
-        return False
-    import ctypes
-    import subprocess
-    if getattr(sys, 'frozen', False):
-        executable = sys.executable
-        parameters = subprocess.list2cmdline(sys.argv[1:])
-    else:
-        executable = sys.executable
-        parameters = subprocess.list2cmdline([str(Path(sys.argv[0]).resolve()), *sys.argv[1:]])
-    result = ctypes.windll.shell32.ShellExecuteW(None, 'runas', executable, parameters, None, 1)
-    if result <= 32:
-        raise OSError(f'UAC elevation was cancelled or failed (ShellExecuteW code {result})')
-    return True
 
 
 def _format_gib(n):
@@ -230,73 +249,167 @@ def _terminate(proc):
         proc.wait()
 
 
-def _supervise(proc, dest, expected, cancelled, progress):
-    """Wait for the tool, reporting bytes written every second and honouring cancellation."""
+def _supervise(proc, dest, expected, cancelled, progress, report=None, tail=None):
+    """Wait for the tool, reporting size/rate/ETA twice a second and honouring cancellation."""
     last = 0.0
-    while proc.poll() is None:
+    meter = RateMeter()
+    while True:
+        try:
+            proc.wait(timeout=0.1)      # returns the moment the tool exits
+            return
+        except subprocess.TimeoutExpired:
+            pass
         if cancelled():
             progress('Cancellation requested; stopping acquisition process')
             _terminate(proc)
             raise InterruptedError('Acquisition cancelled; partial file retained for inspection')
         now = time.monotonic()
-        if now - last >= 1.0:
-            last = now
-            try:
-                written = dest.stat().st_size
-            except OSError:
-                written = 0
-            msg = f'Writing image: {_format_gib(written)}'
-            if expected:
-                msg += f' (installed RAM {_format_gib(expected)}; completion unknown)'
-            progress(msg)
-        time.sleep(0.1)
+        if now - last < 0.5:
+            continue
+        last = now
+        try:
+            written = dest.stat().st_size
+        except OSError:
+            written = 0
+        meter.update(written)
+        pct = min(99.0, written * 100.0 / expected) if expected else 0.0
+        eta = meter.eta(written, expected)
+        msg = f'Writing image: {_format_gib(written)}'
+        if expected:
+            msg += f' of ~{_format_gib(expected)} ({pct:.0f}%)'
+        msg += f' · {meter.rate / MiB:.0f} MiB/s · ETA {format_eta(eta)}'
+        if tail is not None:
+            msg += f' · hashed {_format_gib(tail.done)}'
+        progress(msg)
+        if report is not None:
+            report({'phase': 'acquire', 'done': written, 'total': expected, 'percent': pct,
+                    'rate': meter.rate, 'eta': eta, 'hashed': tail.done if tail else 0})
 
 
-def hash_image(path, cancelled=lambda: False, progress=lambda msg: None):
-    """Read the image once, feeding MD5 and SHA-256 from the same window.
+def hash_image(path, cancelled=lambda: False, progress=lambda msg: None,
+               algorithms=DEFAULT_ALGORITHMS, report=None):
+    """Read the image once (read-only), feeding all selected digests in parallel.
 
-    On multi-core hosts the two digests run on separate threads (hashlib releases the
-    GIL for large buffers), so the total time approaches the slower digest instead of
-    their sum. On single-CPU hosts it stays sequential to avoid thread overhead.
-    Digests are identical either way.
+    Returns ``{'md5': ..., 'sha256': ...}`` (plus ``sha1`` when requested). ``progress``
+    receives text lines; ``report`` receives structured dicts (percent, MiB/s, ETA).
     """
-    md5 = hashlib.md5()
-    sha = hashlib.sha256()
     total = os.path.getsize(path)
-    buf = bytearray(HASH_WINDOW)
-    concurrent = (os.cpu_count() or 1) >= 2
-    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='hash-sha') if concurrent else None
-    done = 0
-    last = time.monotonic()
+    last = [0.0]
+
+    def relay(info):
+        if report is not None:
+            report(info)
+        now = time.monotonic()
+        if now - last[0] >= 1.0:
+            last[0] = now
+            progress(f'Hashing: {_format_gib(info["done"])} of {_format_gib(total)} '
+                     f'({info["percent"]:.0f}%) · {info["rate"] / MiB:.0f} MiB/s · '
+                     f'ETA {format_eta(info["eta"])}')
+
+    return hash_file(path, algorithms, cancelled, relay)
+
+
+def sidecar_paths(dest):
+    """Per-image sidecar names, so several captures can share one folder."""
+    name = dest.name
+    return {
+        'log': dest.with_name(name + '.acquisition.log'),
+        'metadata': dest.with_name(name + '.metadata.json'),
+        'summary': dest.with_name(name + '.summary.txt'),
+        **{a: dest.with_name(f'{name}.{a}') for a in HASH_ALGORITHMS},
+    }
+
+
+def _mount_for(path):
+    best, best_len = None, -1
+    p = str(Path(path).resolve())
+    for part in psutil.disk_partitions(all=True):
+        mp = part.mountpoint
+        if (p == mp or p.startswith(mp.rstrip('\\/') + os.sep) or mp == '/') and len(mp) > best_len:
+            best, best_len = part, len(mp)
+    return best
+
+
+def destination_checks(folder, expected):
+    """Raise for destinations that cannot hold the image; return non-blocking warnings."""
+    warnings = []
     try:
-        with open(path, 'rb', buffering=0) as f:
-            while True:
-                if cancelled():
-                    raise InterruptedError('Hashing cancelled; the image was not validated')
-                n = f.readinto(buf)
-                if not n:
-                    break
-                piece = bytes(memoryview(buf)[:n])
-                if pool is not None:
-                    job = pool.submit(sha.update, piece)
-                    md5.update(piece)
-                    job.result()
-                else:
-                    md5.update(piece)
-                    sha.update(piece)
-                done += n
-                now = time.monotonic()
-                if now - last >= 1.0:
-                    last = now
-                    progress(f'Hashing: {_format_gib(done)} of {_format_gib(total)}')
-    finally:
-        if pool is not None:
-            pool.shutdown(wait=True)
-        del buf
-    return {'md5': md5.hexdigest(), 'sha256': sha.hexdigest()}
+        part = _mount_for(folder)
+    except OSError:
+        part = None
+    if part is not None and part.fstype.lower() in _FAT_TYPES and expected > FAT_LIMIT:
+        raise OSError(f'The destination volume is {part.fstype} (max file size 4 GiB) but installed '
+                      f'RAM is {_format_gib(expected)}. Choose an NTFS/exFAT/ext4 volume.')
+    free = shutil.disk_usage(folder).free
+    if expected and free < expected * FREE_SPACE_MARGIN:
+        raise OSError(f'Insufficient free space: {_format_gib(free)} available; '
+                      f'installed RAM is {_format_gib(expected)}')
+    try:
+        system_root = (os.environ.get('SystemDrive', 'C:') + '\\') if os.name == 'nt' else '/'
+        if os.stat(folder).st_dev == os.stat(system_root).st_dev:
+            warnings.append('Image is being written to the system volume that is being acquired. This overwrites '
+                            'unallocated space and can destroy evidence. Prefer an external evidence drive.')
+    except OSError:
+        pass
+    return warnings
 
 
-def capture_memory(tool, executable, output, cancelled=lambda: False, progress=lambda msg: None, case_id=None, examiner=None):
+def _utc():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _write_new(path, text):
+    with path.open('x', encoding='utf-8') as f:
+        f.write(text)
+
+
+def _write_summary(path, meta, hashes, verified, source):
+    lines = [
+        'PAC HashTools - Memory Acquisition Summary', '=' * 44,
+        f"Case ID:            {meta.get('case_id') or ''}",
+        f"Examiner:           {meta.get('examiner') or ''}",
+        f"Host:               {meta['hostname']} ({meta['operating_system']} {meta['architecture']})",
+        f"Installed RAM:      {format_bytes(meta['total_ram_bytes'])}",
+        f"Tool:               {meta['acquisition_tool']} {meta.get('acquisition_tool_version') or ''}".rstrip(),
+        f"Tool SHA-256:       {meta.get('tool_sha256')}",
+        f"Command:            {' '.join(meta['command_argv'])}",
+        f"Acquisition start:  {meta['acquisition_start']}",
+        f"Acquisition end:    {meta['acquisition_end']}",
+        '', f"Image:              {meta['output_filename']}",
+        f"Image size:         {meta['output_size_bytes']} bytes ({format_bytes(meta['output_size_bytes'])})",
+    ]
+    for algo in HASH_ALGORITHMS:
+        if algo in hashes:
+            lines.append(f"{algo.upper() + ' checksum:':<20}{hashes[algo]}")
+    lines += ['', f'Hash source:        {source}',
+              'Verification:       ' + ('re-read of the finished image confirmed the streamed SHA-256'
+                                         if verified else 'NOT independently re-read'),
+              '', 'Notes:']
+    lines += [f'  - {w}' for w in meta['warnings']]
+    _write_new(path, '\n'.join(lines) + '\n')
+
+
+def _record_outcome(paths, base, status, error):
+    """Persist a failed/cancelled status record next to the retained partial image."""
+    meta = {**base, 'acquisition_status': status, 'acquisition_end': _utc(), 'errors': [str(error)],
+            'validated': False}
+    try:
+        _write_new(paths['metadata'], json.dumps(meta, indent=2, ensure_ascii=False) + '\n')
+    except OSError:
+        pass   # never mask the original failure
+
+
+def capture_memory(tool, executable, output, cancelled=lambda: False, progress=lambda msg: None,
+                   case_id=None, examiner=None, *, algorithms=('md5', 'sha1', 'sha256'),
+                   verify=True, report=None):
+    """Acquire physical RAM with an approved external tool and hash the image.
+
+    ``verify=True`` (recommended) re-reads the finished image and confirms the SHA-256 that
+    was computed while the tool was writing. ``verify=False`` skips that re-read and trusts
+    the streamed digests (fastest; relies on the tool writing sequentially).
+    ``report`` receives structured progress dicts; ``progress`` receives text lines.
+    """
+    algos = normalise_algorithms(algorithms)
     spec = TOOLS.get(tool)
     backend = next((b for b in detect_backends() if b['name'] == tool), None)
     if spec is None or backend is None or not backend['compatible'] or not backend['ready']:
@@ -319,85 +432,189 @@ def capture_memory(tool, executable, output, cancelled=lambda: False, progress=l
         raise FileExistsError(str(dest))
     if dest.suffix.lower() not in IMAGE_SUFFIXES:
         raise ValueError('Use a .mem, .raw or .lime filename for this raw acquisition backend')
-    log_path = dest.with_name(dest.name + '.acquisition.log')
-    if log_path.exists():
-        raise FileExistsError(str(log_path))
-    for sidecar in (dest.with_suffix('.sha256'), dest.with_name('acquisition_metadata.json')):
-        if sidecar.exists():
-            raise FileExistsError(f'Sidecar already exists: {sidecar}')
+    paths = sidecar_paths(dest)
+    for key, p in paths.items():
+        if p.exists():
+            raise FileExistsError(f'{"Log" if key == "log" else "Sidecar"} already exists: {p}')
 
     expected = psutil.virtual_memory().total
-    free = shutil.disk_usage(dest.parent).free
-    if expected and free < expected:
-        raise OSError(f'Insufficient free space: {_format_gib(free)} available; installed RAM is {_format_gib(expected)}')
+    warnings = destination_checks(dest.parent, expected)
+    tool_sha256 = hash_file(exe, ('sha256',))['sha256']
+    tool_version = None   # not probed: running an unverified binary with extra args has side effects; the SHA-256 identifies the build
     args = spec['args'](str(exe), str(dest))
     progress('Starting ' + tool + ': ' + ' '.join(args))
-    started_at = datetime.now(timezone.utc).isoformat()
+    progress(f'Tool SHA-256: {tool_sha256}')
+    for w in warnings:
+        progress('WARNING: ' + w)
+    started_at = _utc()
     started = time.monotonic()
-    logfile = open(log_path, 'x', encoding='utf-8')
+    base = {
+        'schema_version': 2, 'case_id': case_id or None, 'examiner': examiner or None,
+        'acquisition_type': 'Physical RAM', 'hostname': platform.node(),
+        'operating_system': platform.system(), 'os_version': platform.version(),
+        'architecture': platform.machine(), 'cpu_model': platform.processor() or None,
+        'total_ram_bytes': expected, 'acquisition_tool': tool, 'acquisition_tool_version': tool_version,
+        'tool_path': str(exe), 'tool_sha256': tool_sha256, 'tool_source': backend.get('source'),
+        'elevated': True, 'output_filename': dest.name, 'acquisition_start': started_at,
+        'command_argv': args, 'acquisition_log': paths['log'].name, 'hash_algorithms': list(algos),
+    }
+
+    logfile = open(paths['log'], 'x', encoding='utf-8')
     try:
         proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=logfile, stderr=subprocess.STDOUT,
                                 shell=False, start_new_session=(os.name != 'nt'))
     except OSError:
         logfile.close()
-        log_path.unlink(missing_ok=True)   # nothing ran; do not leave an empty log behind
+        paths['log'].unlink(missing_ok=True)   # nothing ran; do not leave an empty log behind
         raise
-    with logfile:
-        try:
-            _supervise(proc, dest, expected, cancelled, progress)
-        finally:
-            if proc.poll() is None:
-                _terminate(proc)
-    acquisition_seconds = time.monotonic() - started
+    tail = TailHasher(dest, algos)
+    tail.start()
+    try:
+        with logfile:
+            try:
+                _supervise(proc, dest, expected, cancelled, progress, report, tail)
+            finally:
+                if proc.poll() is None:
+                    _terminate(proc)
+        acquisition_seconds = time.monotonic() - started
+        if proc.returncode != 0:
+            raise RuntimeError(f'{tool} exited with code {proc.returncode}. Inspect {paths["log"]}; '
+                               'any partial output was retained.')
+        if not dest.is_file() or dest.stat().st_size == 0:
+            raise RuntimeError('Acquisition returned success but no nonempty memory image was produced')
+        size = dest.stat().st_size
+        progress(f'Acquisition complete ({_format_gib(size)} in {acquisition_seconds:.0f} s). '
+                 'Finishing hash of the streamed image…')
+        hash_started = time.monotonic()
+        tail.request_finish()
+        meter = RateMeter()
+        while tail.is_alive():                 # normally already (almost) caught up
+            tail.join(0.2)
+            if cancelled():
+                raise InterruptedError('Hashing cancelled; the image was not validated')
+            if report is not None:
+                meter.update(tail.done)
+                report({'phase': 'hash', 'done': tail.done, 'total': size,
+                        'percent': min(100.0, tail.done * 100.0 / size), 'rate': meter.rate,
+                        'eta': meter.eta(tail.done, size)})
+        streamed = tail.digests
+    except InterruptedError as exc:
+        tail.abort()
+        _record_outcome(paths, base, 'cancelled', exc)
+        raise
+    except BaseException as exc:
+        tail.abort()
+        _record_outcome(paths, base, 'failed', exc)
+        raise
 
-    if proc.returncode != 0:
-        raise RuntimeError(f'{tool} exited with code {proc.returncode}. Inspect {log_path}; '
-                           'any partial output was retained.')
-    if not dest.is_file() or dest.stat().st_size == 0:
-        raise RuntimeError('Acquisition returned success but no nonempty memory image was produced')
-
-    size = dest.stat().st_size
-    warnings = []
+    warnings = list(warnings)
     if expected and size < MIN_EXPECTED_FRACTION * expected:
         warnings.append(f'Image is {size / expected:.0%} of installed RAM; the acquisition may be incomplete. '
-                        f'Review {log_path.name} before relying on it.')
-    progress(f'Acquisition complete ({_format_gib(size)} in {acquisition_seconds:.0f} s). '
-             'Hashing with MD5 and SHA-256…')
-    hash_started = time.monotonic()
-    hashes = hash_image(dest, cancelled, progress)
+                        f'Review {paths["log"].name} before relying on it.')
+    verified, source, verify_seconds = False, 'streamed', 0.0
+    try:
+        usable = streamed is not None and tail.valid and tail.done == size == dest.stat().st_size
+        if usable and verify:
+            vt = time.monotonic()
+            algo = 'sha256' if 'sha256' in algos else algos[0]
+            progress(f'Verifying: re-reading the finished image ({algo.upper()})…')
+            check = hash_file(dest, (algo,), cancelled, report, phase='verify')
+            verify_seconds = time.monotonic() - vt
+            if check[algo] == streamed[algo]:
+                hashes, verified, source = streamed, True, 'streamed, confirmed by re-read'
+            else:
+                warnings.append(f'{algo.upper()} of the finished file differs from the hash computed while '
+                                'writing (the tool may write non-sequentially, or the file changed). '
+                                'Full re-read digests are reported.')
+                hashes, source = hash_file(dest, algos, cancelled, report, phase='verify'), 're-read'
+        elif usable:
+            hashes = streamed
+            warnings.append('Verification re-read was skipped: digests were computed while the tool was '
+                            'writing and assume sequential output.')
+        else:
+            warnings.append('Streamed hashing was not usable (file size changed or tool wrote out of order); '
+                            'digests come from a full re-read.')
+            hashes, source = hash_file(dest, algos, cancelled, report, phase='verify'), 're-read'
+    except InterruptedError as exc:
+        _record_outcome(paths, base, 'cancelled_during_verification', exc)
+        raise
+    hash_seconds = time.monotonic() - hash_started
+    ended_at = _utc()
+    ordered = {a: hashes[a] for a in algos}
     result = {
-        'path': str(dest), 'size': size, 'tool': tool, 'log': str(log_path),
-        'warnings': warnings,
+        'path': str(dest), 'size': size, 'tool': tool, 'log': str(paths['log']),
+        'tool_sha256': tool_sha256, 'tool_version': tool_version,
+        'warnings': warnings, 'verified': verified, 'hash_source': source,
         'acquisition_seconds': round(acquisition_seconds, 1),
-        'hash_seconds': round(time.monotonic() - hash_started, 1),
-        **hashes,
+        'hash_seconds': round(hash_seconds, 1), 'verify_seconds': round(verify_seconds, 1),
+        **ordered,
     }
 
+    metadata = {**base, 'output_size_bytes': size, 'acquisition_end': ended_at,
+                'acquisition_duration_seconds': round(acquisition_seconds, 2),
+                'hashes': ordered, **ordered, 'hash_source': source, 'verified_by_reread': verified,
+                'acquisition_status': 'completed_tool_reported_success', 'validated': verified,
+                'warnings': warnings + ['Acquisition changes volatile memory; a digest does not prove completeness.'],
+                'errors': []}
     # Sidecars are written after successful acquisition and hashing. Never rewrite the image.
-    ended_at = datetime.now(timezone.utc).isoformat()
-    metadata = {
-        'schema_version': 1, 'case_id': case_id or None, 'examiner': examiner or None,
-        'acquisition_type': 'Physical RAM', 'hostname': platform.node(),
-        'operating_system': platform.system(), 'os_version': platform.version(),
-        'architecture': platform.machine(), 'cpu_model': platform.processor() or None,
-        'total_ram_bytes': expected, 'acquisition_tool': tool,
-        'acquisition_tool_version': None, 'output_filename': dest.name,
-        'output_size_bytes': size, 'acquisition_start': started_at,
-        'acquisition_end': ended_at, 'acquisition_duration_seconds': round(acquisition_seconds, 2),
-        'sha256': hashes['sha256'], 'md5': hashes['md5'],
-        'acquisition_status': 'completed_tool_reported_success',
-        'warnings': warnings + ['Acquisition changes volatile memory; a SHA-256 digest does not prove completeness.'],
-        'errors': [], 'command_argv': args, 'acquisition_log': log_path.name,
-    }
-    sha_path = dest.with_suffix('.sha256')
-    metadata_path = dest.with_name('acquisition_metadata.json')
-    for sidecar in (sha_path, metadata_path):
-        if sidecar.exists():
-            raise FileExistsError(f'Sidecar already exists; evidence preserved: {sidecar}')
-    with sha_path.open('x', encoding='utf-8') as f:
-        f.write(f"{hashes['sha256']}  {dest.name}\n")
-    with metadata_path.open('x', encoding='utf-8') as f:
-        json.dump(metadata, f, indent=2, ensure_ascii=False)
-        f.write('\n')
-    result.update(metadata_path=str(metadata_path), sha256_file=str(sha_path))
+    for algo, digest in ordered.items():
+        _write_new(paths[algo], f'{digest}  {dest.name}\n')       # `sha256sum -c` compatible
+    _write_new(paths['metadata'], json.dumps(metadata, indent=2, ensure_ascii=False) + '\n')
+    _write_summary(paths['summary'], metadata, ordered, verified, source)
+    result.update(metadata_path=str(paths['metadata']), summary_path=str(paths['summary']),
+                  sha256_file=str(paths['sha256']) if 'sha256' in ordered else None)
     return result
+
+
+# --------------------------------------------------------------------------- verification
+def _read_reference_hashes(image):
+    """Hashes recorded by a previous acquisition, if its sidecars sit next to the image."""
+    image = Path(image)
+    refs = {}
+    for algo in HASH_ALGORITHMS:
+        for candidate in (image.with_name(image.name + '.' + algo), image.with_suffix('.' + algo)):
+            try:
+                token = candidate.read_text(encoding='utf-8').split()[0].strip().lower()
+            except (OSError, IndexError, UnicodeDecodeError):
+                continue
+            if len(token) == {'md5': 32, 'sha1': 40, 'sha256': 64}[algo]:
+                refs[algo] = (token, candidate.name)
+                break
+    size = None
+    try:
+        meta = json.loads(image.with_name(image.name + '.metadata.json').read_text(encoding='utf-8'))
+        size = meta.get('output_size_bytes')
+        for algo in HASH_ALGORITHMS:
+            if algo not in refs and isinstance(meta.get(algo), str):
+                refs[algo] = (meta[algo].lower(), image.name + '.metadata.json')
+    except (OSError, ValueError):
+        pass
+    return refs, size
+
+
+def verify_image(path, expected=None, cancelled=lambda: False, progress=lambda msg: None,
+                 algorithms=('md5', 'sha1', 'sha256'), report=None):
+    """Hash an existing image read-only and compare it with a typed hash and/or the sidecars
+    written at acquisition time. ``verification`` is MATCH, MISMATCH or NO REFERENCE."""
+    algos = normalise_algorithms(algorithms)
+    refs, ref_size = _read_reference_hashes(path)
+    typed = (expected or '').strip().lower()
+    if typed:
+        algo = {32: 'md5', 40: 'sha1', 64: 'sha256'}.get(len(typed))
+        if algo is None or any(c not in '0123456789abcdef' for c in typed):
+            raise ValueError('Expected hash must be 32 (MD5), 40 (SHA-1) or 64 (SHA-256) hex characters')
+        refs[algo] = (typed, 'typed value')
+        algos = normalise_algorithms((*algos, algo))
+    size = os.path.getsize(path)
+    hashes = hash_image(path, cancelled, progress, algos, report)
+    comparisons = [{'algorithm': a, 'expected': refs[a][0], 'actual': hashes[a], 'source': refs[a][1],
+                    'match': refs[a][0] == hashes[a]} for a in algos if a in refs]
+    size_ok = None if ref_size is None else (ref_size == size)
+    if comparisons and all(c['match'] for c in comparisons) and size_ok is not False:
+        outcome = 'MATCH'
+    elif comparisons or size_ok is False:
+        outcome = 'MISMATCH'
+    else:
+        outcome = 'NO REFERENCE'
+    return {'path': str(path), 'size': size, **hashes, 'verification': outcome,
+            'comparisons': comparisons, 'size_matches_record': size_ok}

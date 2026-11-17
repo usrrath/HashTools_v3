@@ -7,29 +7,53 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel,
     QLineEdit, QPushButton, QFileDialog, QProgressBar, QPlainTextEdit, QTabWidget,
     QGroupBox, QMessageBox, QComboBox, QCheckBox, QSplitter, QGridLayout)
-from services.memory_capture_service import collect_response, hash_file, system_info
-from services.physical_memory_backend import detect_backends, capture_memory, IMAGE_SUFFIXES, is_elevated, native_architecture, request_administrator_restart
+from datetime import datetime
+from services.memory_capture_service import collect_response, system_info
+from services.memory_hashing import hash_file as sha256_of, format_bytes, format_eta
+from services.physical_memory_backend import (detect_backends, capture_memory, verify_image, register_custom_tool,
+    IMAGE_SUFFIXES, is_elevated, native_architecture, UnsupportedCapture, sidecar_paths)
 
 class Job(QThread):
     status = pyqtSignal(str)
+    progress = pyqtSignal(object)     # structured: phase, percent, rate, eta ...
     result = pyqtSignal(object)
     failed = pyqtSignal(str)
-    def __init__(self, kind, *args):
+    def __init__(self, kind, *args, **opts):
         super().__init__()
-        self.kind, self.args = kind, args
+        self.kind, self.args, self.opts = kind, args, opts
         self.stop = threading.Event()
     def run(self):
         try:
             if self.kind == 'response':
                 value = collect_response(*self.args, cancelled=self.stop.is_set, progress=self.status.emit)
             elif self.kind == 'physical':
-                value = capture_memory(*self.args[:3], cancelled=self.stop.is_set, progress=self.status.emit, case_id=self.args[3], examiner=self.args[4])
+                value = capture_memory(*self.args[:3], cancelled=self.stop.is_set, progress=self.status.emit,
+                                       report=self.progress.emit, case_id=self.args[3], examiner=self.args[4],
+                                       algorithms=self.opts['algorithms'], verify=self.opts['verify'])
             else:
-                self.status.emit('Computing MD5 and SHA-256 without modifying the image…')
-                value = {'path': self.args[0], **hash_file(self.args[0], self.stop.is_set)}
+                self.status.emit('Computing hashes without modifying the image…')
+                value = verify_image(self.args[0], self.opts.get('expected'), cancelled=self.stop.is_set,
+                                     progress=self.status.emit, algorithms=self.opts['algorithms'],
+                                     report=self.progress.emit)
             self.result.emit(value)
         except Exception as exc:
             self.failed.emit(f'{type(exc).__name__}: {exc}')
+
+PHASE_LABEL = {'acquire': 'Acquiring', 'hash': 'Hashing', 'verify': 'Verifying'}
+
+def fresh_evidence_name(physical, folder=None):
+    """A new timestamped default name that is not already used in ``folder`` (including sidecars)."""
+    stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    stem, ext = ('memory_dump', '.mem') if physical else ('live_response', '.zip')
+    candidate, counter = f'{stem}_{stamp}{ext}', 2
+    while folder is not None and _name_taken(Path(folder), candidate, physical):
+        candidate = f'{stem}_{stamp}_{counter}{ext}'
+        counter += 1
+    return candidate
+
+def _name_taken(folder, name, physical):
+    path = folder / name
+    return path.exists() or (physical and any(p.exists() for p in sidecar_paths(path).values()))
 
 class MemoryCaptureTab(QWidget):
     def __init__(self):
@@ -69,12 +93,14 @@ class MemoryCaptureTab(QWidget):
         self.recheck = QPushButton('Re-check tools')
         self.recheck.setToolTip('Look for installed acquisition tools again without restarting HashTools.')
         self.recheck.clicked.connect(self.refresh_backends)
-        self.elevate = QPushButton('Restart as Administrator')
-        self.elevate.clicked.connect(self.restart_elevated)
         backend_row = QHBoxLayout()
         backend_row.addWidget(self.backend, 1)
         backend_row.addWidget(self.recheck)
-        backend_row.addWidget(self.elevate)
+        self.browse_tool = QPushButton('Browse tool…')
+        self.browse_tool.setToolTip('Approve a specific acquisition executable (shows its SHA-256 first). '
+                                    'Alternatively place it in the "tools" folder next to HashTools or on PATH.')
+        self.browse_tool.clicked.connect(self.choose_tool)
+        backend_row.addWidget(self.browse_tool)
         form.addRow('Acquisition tool', backend_row)
         self.populate_backends()
         form.addRow('Acquisition method', self.mode)
@@ -85,8 +111,22 @@ class MemoryCaptureTab(QWidget):
         folder_row.addWidget(self.folder, 1)
         folder_row.addWidget(browse)
         form.addRow('Destination folder', folder_row)
-        self.filename = QLineEdit('live_response.zip')
+        self.filename = QLineEdit(fresh_evidence_name(False))
         form.addRow('Evidence filename', self.filename)
+        self.algo_boxes = {}
+        algo_row = QHBoxLayout()
+        for key, caption in (('md5', 'MD5'), ('sha1', 'SHA-1'), ('sha256', 'SHA-256')):
+            box = QCheckBox(caption)
+            box.setChecked(True)
+            self.algo_boxes[key] = box
+            algo_row.addWidget(box)
+        algo_row.addStretch(1)
+        form.addRow('Hashes', algo_row)
+        self.verify_after = QCheckBox('Verify image after capture (re-read the file and confirm SHA-256)')
+        self.verify_after.setChecked(True)
+        self.verify_after.setToolTip('The image is hashed while it is written. Verification re-reads the finished '
+                                     'file to confirm those digests. Turn off only to save time.')
+        form.addRow('Integrity', self.verify_after)
         capture_layout.addWidget(group)
         support_group = QGroupBox('Acquisition availability')
         support_layout = QVBoxLayout(support_group)
@@ -124,11 +164,14 @@ class MemoryCaptureTab(QWidget):
         image_row.addWidget(self.image, 1)
         image_row.addWidget(pick)
         verify_form.addRow('Image file', image_row)
-        self.verify = QPushButton('Calculate MD5 + SHA-256')
+        self.expected = QLineEdit()
+        self.expected.setPlaceholderText('Optional: expected MD5 / SHA-1 / SHA-256 (.sha256/.md5/.metadata.json beside the image are read automatically)')
+        verify_form.addRow('Expected hash', self.expected)
+        self.verify = QPushButton('Calculate hashes and compare')
         self.verify.clicked.connect(self.verify_image)
         verify_form.addRow(self.verify)
         inspect_layout.addWidget(verify_group)
-        hint = QLabel('Verification reads the selected file only. It does not analyze memory contents or determine the source operating system.')
+        hint = QLabel('Verification reads the selected file only (read-only). It compares against a typed hash and against the sidecar files written at acquisition time; it does not analyze memory contents.')
         hint.setWordWrap(True)
         inspect_layout.addWidget(hint)
         inspect_layout.addStretch(1)
@@ -163,6 +206,7 @@ class MemoryCaptureTab(QWidget):
         refresh.clicked.connect(self.refresh_system)
         info_layout.addWidget(refresh)
         self.tabs.addTab(info, 'System Information')
+        self._last_physical = None
         self.mode.currentIndexChanged.connect(self.mode_changed)
         self.backend.currentIndexChanged.connect(self.mode_changed)
         self.mode_changed()
@@ -216,8 +260,7 @@ class MemoryCaptureTab(QWidget):
         ready = bool(backend and backend['ready'])
         self.backend.setEnabled(physical and self.job is None)
         self.recheck.setEnabled(self.job is None)
-        self.elevate.setVisible(physical and not is_elevated())
-        self.elevate.setEnabled(self.job is None)
+        self.browse_tool.setEnabled(self.job is None and physical)
         self.switch_live.setVisible(physical and not ready)
         self.switch_live.setEnabled(self.job is None)
         allowed = not physical or (ready and is_elevated())
@@ -227,26 +270,34 @@ class MemoryCaptureTab(QWidget):
             if not ready:
                 reason = self._physical_unavailable_reason()
             elif not is_elevated():
-                reason = 'Click Restart as Administrator and accept Windows UAC; your current session will close.'
+                reason = 'Restart HashTools as Administrator to capture physical RAM.'
             else:
                 reason = 'Ready to start physical RAM acquisition.'
             self.start.setToolTip(reason)
         else:
             self.start.setToolTip('Collect volatile process, network and system information to a ZIP; this is not physical RAM.')
         self.backend.setToolTip('Physical acquisition requires an installed, compatible external tool. Live response does not.')
-        if self.job is None:
-            self.state.setText(self._physical_unavailable_reason() if physical and not ready else ('Administrator privileges required' if physical and not is_elevated() else 'Ready to collect evidence')) if hasattr(self, 'state') else None
-        if physical and self.filename.text().endswith('.zip'):
-            self.filename.setText('memory_dump.mem')
-        elif not physical and self.filename.text().endswith(IMAGE_SUFFIXES):
-            self.filename.setText('live_response.zip')
+        if self.job is None and hasattr(self, 'state'):
+            if physical and not ready:
+                self.state.setText(self._physical_unavailable_reason())
+            elif physical and not is_elevated():
+                self.state.setText('Administrator privileges required')
+            else:
+                self.state.setText('Ready to collect evidence')
+        if hasattr(self, 'verify_after'):
+            self.verify_after.setEnabled(physical and self.job is None)
+        # Switching method always proposes a name of the right type, so the extension matches the mode.
+        if self._last_physical is not None and physical != self._last_physical:
+            self.filename.setText(fresh_evidence_name(physical))
+        self._last_physical = physical
         if physical:
             elevation = 'Running with administrator/root rights.' if is_elevated() else \
                 'NOT running with administrator/root rights: acquisition will be refused until HashTools is restarted elevated.'
             self.support.setText((f"{backend['name']}: {backend['reason']}. " if backend else self._physical_unavailable_reason() + '. ') +
                 elevation + ' A memory image exists only after the tool exits successfully and the file is hashed. '
-                f'Native OS architecture: {native_architecture()}. Potential backends: Windows x64 (WinPmem), Linux x64 (AVML). '
-                'macOS physical RAM acquisition is unavailable without a separately verified compatible backend.')
+                f'Native OS architecture: {native_architecture()}. Supported: Windows x64 (winpmem_mini_x64.exe), '
+                'Linux x86_64 and aarch64 (avml). macOS (Intel and Apple Silicon) and Windows ARM64 have no verified '
+                'physical RAM tool in HashTools; use Live-Response ZIP there.')
         else:
             self.support.setText('Live response is available on Windows, Linux and macOS. It collects accessible process, network, session and host metadata into a forensic ZIP. It is NOT a physical RAM image.')
 
@@ -281,26 +332,36 @@ class MemoryCaptureTab(QWidget):
             for label in self.system_labels.values():
                 label.setText('Unavailable')
 
-    def restart_elevated(self):
-        if self.job is not None:
-            QMessageBox.warning(self, 'Acquisition active', 'Finish or cancel the current operation before restarting.')
+    def algorithms(self):
+        return tuple(k for k, box in self.algo_boxes.items() if box.isChecked())
+
+    def choose_tool(self):
+        compatible = [b for b in self._detected_backends if b.get('compatible')]
+        if not compatible:
+            QMessageBox.information(self, 'No compatible tool', self._physical_unavailable_reason())
             return
-        if is_elevated():
-            self.refresh_backends()
-            return
-        answer = QMessageBox.question(
-            self, 'Restart as Administrator',
-            'Windows will display a UAC permission prompt. The current HashTools session '
-            'will close after the elevated instance starts. Unsaved form values will be lost. Continue?',
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if answer != QMessageBox.StandardButton.Yes:
+        name = compatible[0]['name']
+        hint = 'winpmem_mini_x64.exe' if name == 'WinPmem' else 'avml'
+        selected, _ = QFileDialog.getOpenFileName(self, f'Select {hint}', '', f'{hint} (*{Path(hint).suffix or ""});;All files (*)' if name == 'WinPmem' else 'All files (*)')
+        if not selected:
             return
         try:
-            if request_administrator_restart():
-                from PyQt6.QtWidgets import QApplication
-                QApplication.instance().quit()
-        except Exception as exc:
-            QMessageBox.warning(self, 'Elevation failed', str(exc))
+            digest = sha256_of(selected, ('sha256',))['sha256']
+        except OSError as exc:
+            QMessageBox.warning(self, 'Cannot read tool', str(exc))
+            return
+        if QMessageBox.question(self, 'Approve acquisition tool',
+                f'Approve this executable for physical RAM acquisition?\n\n{selected}\nSHA-256: {digest}\n\n'
+                'Compare the SHA-256 with the value published by the tool vendor. It is recorded in the evidence metadata.') \
+                != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            register_custom_tool(name, selected)
+        except (UnsupportedCapture, OSError) as exc:
+            QMessageBox.warning(self, 'Tool not accepted', str(exc))
+            return
+        self.log.appendPlainText(f'Approved {name}: {selected}  SHA-256 {digest}')
+        self.refresh_backends()
 
     def choose_folder(self):
         selected = QFileDialog.getExistingDirectory(self, 'Choose evidence destination', self.folder.text())
@@ -326,8 +387,13 @@ class MemoryCaptureTab(QWidget):
             QMessageBox.warning(self, 'Invalid destination', 'Select an existing destination folder.')
             return
         path = folder / name
-        if path.exists():
-            QMessageBox.warning(self, 'Evidence already exists', 'Existing evidence will never be overwritten.')
+        if _name_taken(folder, name, physical):
+            # Never overwrite: propose a fresh timestamped name so the examiner can simply press Start again.
+            fresh = fresh_evidence_name(physical, folder)
+            self.filename.setText(fresh)
+            QMessageBox.warning(self, 'Name already used',
+                f'\'{name}\' already exists in\n{folder}\n\nHashTools never overwrites evidence. '
+                f'A new name, \'{fresh}\', has been filled in. Review it and press Start again.')
             return
         if physical:
             # Re-detect at the moment of capture so a tool installed since startup is picked up.
@@ -337,12 +403,16 @@ class MemoryCaptureTab(QWidget):
                 QMessageBox.warning(self, 'Backend unavailable', self._physical_unavailable_reason())
                 return
             if not is_elevated():
-                QMessageBox.warning(self, 'Elevation required', f"{backend['name']} needs {backend['privilege']} rights. Use Restart as Administrator.")
+                QMessageBox.warning(self, 'Elevation required', f"{backend['name']} needs {backend['privilege']} rights. Restart HashTools elevated.")
                 return
             if QMessageBox.question(self, 'Confirm physical RAM acquisition',
                     'Acquire volatile physical RAM from this authorized host? This operation changes system memory and may load a driver.') != QMessageBox.StandardButton.Yes:
                 return
-            self.launch('physical', backend['name'], backend['path'], str(path), self.case.text().strip(), self.examiner.text().strip())
+            if not self.algorithms():
+                QMessageBox.warning(self, 'No hash selected', 'Select at least one hash algorithm.')
+                return
+            self.launch('physical', backend['name'], backend['path'], str(path), self.case.text().strip(),
+                        self.examiner.text().strip(), algorithms=self.algorithms(), verify=self.verify_after.isChecked())
         else:
             self.launch('response', str(path), self.case.text().strip(), self.examiner.text().strip())
 
@@ -355,21 +425,25 @@ class MemoryCaptureTab(QWidget):
         if not valid:
             QMessageBox.warning(self, 'Invalid memory image', 'Select a readable, nonempty image file.')
             return
-        self.launch('hash', str(path))
+        if not self.algorithms():
+            QMessageBox.warning(self, 'No hash selected', 'Select at least one hash algorithm.')
+            return
+        self.launch('hash', str(path), algorithms=self.algorithms(), expected=self.expected.text().strip() or None)
 
-    def launch(self, kind, *args):
+    def launch(self, kind, *args, **opts):
         if self.job is not None:
             return
         self._outcome = None
-        job = Job(kind, *args)
+        self._final_text = ''
+        job = Job(kind, *args, **opts)
         self.job = job
         job.status.connect(self.on_status)
+        job.progress.connect(self.on_progress)
         job.result.connect(self.success)
         job.failed.connect(self.failure)
         job.finished.connect(self.finished)
-        self.progress.setRange(0, 100)
-        self.progress.setValue(0)
-        self.progress.setRange(0, 0)
+        self.progress.setFormat('%p%')
+        self.progress.setRange(0, 0)          # indeterminate until the first structured report arrives
         self.state.setText('Working…')
         self.start.setEnabled(False)
         self.verify.setEnabled(False)
@@ -379,11 +453,34 @@ class MemoryCaptureTab(QWidget):
 
     def on_status(self, message):
         self.state.setText(message)
-        self.log.appendPlainText(message)
+        # Live counters refresh the status line only; everything else is kept in the log.
+        if not message.startswith(('Writing image', 'Hashing:')):
+            self.log.appendPlainText(message)
+
+    def on_progress(self, info):
+        if self.progress.maximum() == 0:
+            self.progress.setRange(0, 1000)
+        self.progress.setValue(int(max(0.0, min(100.0, info.get('percent', 0.0))) * 10))
+        label = PHASE_LABEL.get(info.get('phase'), 'Working')
+        rate = info.get('rate') or 0
+        self.progress.setFormat(f"{label} %p%  ·  {format_bytes(rate)}/s  ·  ETA {format_eta(info.get('eta'))}")
 
     def success(self, result):
         self._outcome = 'success'
-        self.state.setText('Completed — SHA-256 recorded')
+        self._final_text = 'Completed — evidence saved and hashed'
+        if 'verification' in result:
+            self._final_text = f"Verification result: {result['verification']}"
+            if result['verification'] == 'MISMATCH':
+                self._outcome = 'failed'
+                self._final_text = 'Verification result: MISMATCH — image differs from the recorded hash'
+            for c in result.get('comparisons', []):
+                self.log.appendPlainText(f"{c['algorithm'].upper()}: {'MATCH' if c['match'] else 'MISMATCH'} (reference: {c['source']})")
+            if result.get('size_matches_record') is False:
+                self.log.appendPlainText('Image size differs from the size recorded at acquisition.')
+        elif result.get('verified'):
+            self._final_text = 'Completed — image hashed and verified by re-read'
+        elif 'hash_source' in result:
+            self._final_text = 'Completed — hashed (not re-read; see warnings)'
         for warning in result.get('warnings', []):
             self.log.appendPlainText('WARNING: ' + warning)
         self.log.appendPlainText('SUCCESS:\n' + json.dumps(result, indent=2))
@@ -394,6 +491,7 @@ class MemoryCaptureTab(QWidget):
         self.log.appendPlainText('FAILED / CANCELLED: ' + message)
 
     def finished(self):
+        self.progress.setFormat('%p%')
         self.progress.setRange(0, 100)
         self.progress.setValue(100 if self._outcome == 'success' else 0)
         self.cancel.setEnabled(False)
@@ -404,7 +502,9 @@ class MemoryCaptureTab(QWidget):
         if job is not None:
             job.deleteLater()
         if self._outcome == 'success':
-            self.state.setText('Completed — evidence saved and hashed')
+            self.state.setText(getattr(self, '_final_text', 'Completed — evidence saved and hashed'))
+        elif self._outcome == 'failed' and getattr(self, '_final_text', '').startswith('Verification'):
+            self.state.setText(self._final_text)
         elif self._outcome == 'failed':
             self.state.setText('Failed / cancelled — see activity log')
 
