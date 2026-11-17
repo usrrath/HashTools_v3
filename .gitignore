@@ -1,0 +1,24 @@
+
+# Python environments
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Build outputs
+build/
+dist/
+installer/
+*.dmg
+*.exe
+*.app/
+*.pkg
+
+# Local settings and secrets
+.env
+.env.*
+!.env.example
+
+# IDE and OS
+.idea/
+.DS_Store
