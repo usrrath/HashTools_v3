@@ -1,35 +1,39 @@
-<CodeBlock language="yaml" editable>
-      - name: Validate Inno Setup script
-        shell: pwsh
-        run: |
-          $script = "packaging/HashTools_Setup.iss"
 
+#define MyAppName "HashTools v3"
+#define MyAppVersion "3.0"
+#define MyAppPublisher "HashTools"
+#define MyAppExeName "HashTools_v3.exe"
 
-if (!(Test-Path $script -PathType Leaf)) {
-throw "Inno Setup script not found."
-}
+[Setup]
+AppId={{E84E4A9D-7F2A-48F1-B72D-BC238BE231A7}}
+AppName={#MyAppName}
+AppVersion={#MyAppVersion}
+AppPublisher={#MyAppPublisher}
+DefaultDirName={autopf}\HashTools
+DefaultGroupName=HashTools
+OutputDir=..\installer
+OutputBaseFilename=HashTools_v3_Setup_Windows_x64
+Compression=lzma
+SolidCompression=yes
+WizardStyle=modern
+PrivilegesRequired=admin
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
+UninstallDisplayIcon={app}\{#MyAppExeName}
+DisableProgramGroupPage=yes
 
-$content = Get-Content $script -Raw
+[Languages]
+Name: "english"; MessagesFile: "compiler:Default.isl"
 
-if ($content.Contains("<CodeBlock") -or
-$content.Contains("</CodeBlock>") -or
-$content.Contains([string][char]96)) {
-throw "Inno Setup script contains Markdown formatting."
-}
+[Tasks]
+Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional icons:"
 
-$first = Get-Content $script |
-Where-Object { $_.Trim() -ne "" } |
-Select-Object -First 1
+[Files]
+Source: "..\dist\HashTools_v3\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
-if ($first -notmatch '^\s*(#|;|\[)') {
-throw "Invalid first line in Inno Setup script: $first"
-}
+[Icons]
+Name: "{group}\HashTools v3"; Filename: "{app}\{#MyAppExeName}"
+Name: "{autodesktop}\HashTools v3"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
-foreach ($section in @("[Setup]", "[Files]", "[Icons]")) {
-if (!$content.Contains($section)) {
-throw "Missing Inno Setup section: $section"
-}
-}
-
-Write-Host "Inno Setup validation passed."
-</CodeBlock>
+[Run]
+Filename: "{app}\{#MyAppExeName}"; Description: "Launch HashTools v3"; Flags: nowait postinstall skipifsilent
