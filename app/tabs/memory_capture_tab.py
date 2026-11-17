@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLa
     QLineEdit, QPushButton, QFileDialog, QProgressBar, QPlainTextEdit, QTabWidget,
     QGroupBox, QMessageBox, QComboBox, QCheckBox, QSplitter, QGridLayout)
 from services.memory_capture_service import collect_response, hash_file, system_info
-from services.physical_memory_backend import detect_backends, capture_memory, IMAGE_SUFFIXES, is_elevated
+from services.physical_memory_backend import detect_backends, capture_memory, IMAGE_SUFFIXES, is_elevated, native_architecture
 
 class Job(QThread):
     status = pyqtSignal(str)
@@ -65,6 +65,7 @@ class MemoryCaptureTab(QWidget):
         self.mode = QComboBox()
         self.mode.addItems(['Live-response collection (ZIP)', 'Physical RAM acquisition (.mem)'])
         self.backend = QComboBox()
+        self._detected_backends = []
         self.recheck = QPushButton('Re-check tools')
         self.recheck.setToolTip('Look for installed acquisition tools again without restarting HashTools.')
         self.recheck.clicked.connect(self.refresh_backends)
@@ -188,6 +189,7 @@ class MemoryCaptureTab(QWidget):
         self.backend.blockSignals(True)
         self.backend.clear()
         backends = detect_backends()
+        self._detected_backends = backends
         for backend in backends:
             if backend.get('compatible'):
                 self.backend.addItem(f"{backend['name']} — {backend['reason']}", backend)
@@ -213,11 +215,22 @@ class MemoryCaptureTab(QWidget):
         self.recheck.setEnabled(self.job is None)
         self.switch_live.setVisible(physical and not ready)
         self.switch_live.setEnabled(self.job is None)
-        self.start.setEnabled(self.job is None and (not physical or (ready and is_elevated())))
-        self.start.setText(('Capture Physical RAM' if ready else 'Physical RAM unavailable on this host') if physical else 'Start Live-Response Capture')
+        allowed = not physical or (ready and is_elevated())
+        self.start.setEnabled(self.job is None and allowed)
+        self.start.setText('Capture Physical RAM' if physical else 'Start Live-Response Capture')
+        if physical:
+            if not ready:
+                reason = self._physical_unavailable_reason()
+            elif not is_elevated():
+                reason = 'Restart HashTools as Administrator to capture physical RAM.'
+            else:
+                reason = 'Ready to start physical RAM acquisition.'
+            self.start.setToolTip(reason)
+        else:
+            self.start.setToolTip('Collect volatile process, network and system information to a ZIP; this is not physical RAM.')
         self.backend.setToolTip('Physical acquisition requires an installed, compatible external tool. Live response does not.')
         if self.job is None:
-            self.state.setText('Physical RAM unavailable — choose Live-response collection' if physical and not ready else 'Ready to collect evidence') if hasattr(self, 'state') else None
+            self.state.setText(self._physical_unavailable_reason() if physical and not ready else ('Administrator privileges required' if physical and not is_elevated() else 'Ready to collect evidence')) if hasattr(self, 'state') else None
         if physical and self.filename.text().endswith('.zip'):
             self.filename.setText('memory_dump.mem')
         elif not physical and self.filename.text().endswith(IMAGE_SUFFIXES):
@@ -225,16 +238,28 @@ class MemoryCaptureTab(QWidget):
         if physical:
             elevation = 'Running with administrator/root rights.' if is_elevated() else \
                 'NOT running with administrator/root rights: acquisition will be refused until HashTools is restarted elevated.'
-            self.support.setText((f"{backend['name']}: {backend['reason']}. " if backend else 'No tool selected. ') +
+            self.support.setText((f"{backend['name']}: {backend['reason']}. " if backend else self._physical_unavailable_reason() + '. ') +
                 elevation + ' A memory image exists only after the tool exits successfully and the file is hashed. '
-                'Potential backends: Windows x64 (WinPmem), Linux x64 (AVML). '
+                f'Native OS architecture: {native_architecture()}. Potential backends: Windows x64 (WinPmem), Linux x64 (AVML). '
                 'macOS physical RAM acquisition is unavailable without a separately verified compatible backend.')
         else:
             self.support.setText('Live response is available on Windows, Linux and macOS. It collects accessible process, network, session and host metadata into a forensic ZIP. It is NOT a physical RAM image.')
 
+    def _physical_unavailable_reason(self):
+        system = __import__('platform').system()
+        arch = native_architecture()
+        matches = [b for b in self._detected_backends if b['name'] == ('WinPmem' if system == 'Windows' else 'AVML')]
+        if system == 'Windows' and arch == 'arm64':
+            return 'Windows ARM64 detected. WinPmem x64 kernel driver cannot capture ARM64 RAM. No verified ARM64 backend configured; use Live-Response ZIP.'
+        if matches:
+            return matches[0]['reason']
+        return f'No supported physical RAM acquisition backend for {system}/{arch}; use Live-Response ZIP.'
+
     def refresh_system(self):
         try:
             info = system_info()
+            info['native_os_architecture'] = native_architecture()
+            info['acquisition_backends'] = self._detected_backends
             self.system.setPlainText(json.dumps(info, indent=2))
             for key, label in self.system_labels.items():
                 value = info.get(key)
@@ -283,7 +308,7 @@ class MemoryCaptureTab(QWidget):
             self.refresh_backends()
             backend = self.backend.currentData()
             if not backend or not backend['ready']:
-                QMessageBox.warning(self, 'Backend unavailable', 'Install a trusted, compatible acquisition tool on PATH and press Re-check tools.')
+                QMessageBox.warning(self, 'Backend unavailable', self._physical_unavailable_reason())
                 return
             if not is_elevated():
                 QMessageBox.warning(self, 'Elevation required', f"{backend['name']} needs {backend['privilege']} rights. Restart HashTools elevated.")
@@ -316,6 +341,8 @@ class MemoryCaptureTab(QWidget):
         job.result.connect(self.success)
         job.failed.connect(self.failure)
         job.finished.connect(self.finished)
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
         self.progress.setRange(0, 0)
         self.state.setText('Working…')
         self.start.setEnabled(False)

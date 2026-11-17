@@ -13,6 +13,7 @@ import json
 from datetime import datetime, timezone
 import os
 import platform
+import sys
 import shutil
 import signal
 import subprocess
@@ -62,8 +63,29 @@ TOOLS = {
 }
 
 
+def native_architecture():
+    """Return native OS architecture, not the architecture of an emulated Python process."""
+    if os.name == 'nt':
+        try:
+            import ctypes
+            native = ctypes.c_ushort()
+            process = ctypes.c_ushort()
+            kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+            fn = kernel.IsWow64Process2
+            fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ushort), ctypes.POINTER(ctypes.c_ushort)]
+            fn.restype = ctypes.c_int
+            if fn(kernel.GetCurrentProcess(), ctypes.byref(process), ctypes.byref(native)):
+                return {0xAA64: 'arm64', 0x8664: 'x86_64', 0x014c: 'x86'}.get(native.value, f'unknown-{native.value:x}')
+        except (AttributeError, OSError, ValueError):
+            pass
+        # Windows also exposes the native architecture to emulated processes.
+        arch = os.environ.get('PROCESSOR_ARCHITEW6432') or os.environ.get('PROCESSOR_ARCHITECTURE', '')
+        return {'amd64': 'x86_64', 'arm64': 'arm64', 'x86': 'x86'}.get(arch.lower(), arch.lower() or 'unknown')
+    return platform.machine().lower()
+
+
 def _system_arch():
-    return platform.system(), platform.machine().lower()
+    return platform.system(), native_architecture()
 
 
 def _unsupported_reason(name, system, arch):
@@ -71,6 +93,8 @@ def _unsupported_reason(name, system, arch):
         return 'Apple Silicon (arm64): no supported physical RAM acquisition tool exists'
     if name == 'OSXPmem' and system == 'Darwin':
         return 'RAM acquisition is currently unsupported on this macOS configuration.'
+    if system == 'Windows' and arch == 'arm64' and name == 'WinPmem':
+        return 'Windows ARM64: WinPmem x64 kernel driver is not compatible with the ARM64 kernel; a separately verified ARM64 driver/backend is required'
     return f'Unsupported on {system}/{arch}'
 
 
@@ -90,7 +114,8 @@ def detect_backends():
     results = []
     for name, spec in TOOLS.items():
         compatible = system == spec['os'] and arch in spec['arch'] and spec['args'] is not None
-        path = shutil.which(spec['binary']) if compatible else None
+        # Report the detected binary even when incompatible, but never execute it.
+        path = shutil.which(spec['binary']) if system == spec['os'] else None
         if compatible and path:
             reason = spec['ready']
         elif compatible:
