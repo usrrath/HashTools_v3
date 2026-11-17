@@ -1,45 +1,42 @@
-
-name: Build HashTools Windows EXE
+name: Build HashTools Windows
 
 on:
   workflow_dispatch:
 
 jobs:
-  build-windows:
+  windows:
     runs-on: windows-latest
 
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-          architecture: "x64"
+          python-version: '3.12'
+          architecture: x64
 
       - name: Install dependencies
-        shell: pwsh
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
           python -m pip install pyinstaller
 
-      - name: Build Windows EXE
+      - name: Build Windows executable
         shell: pwsh
         run: |
           python -m PyInstaller `
             --noconfirm `
             --clean `
-            --onefile `
+            --onedir `
             --windowed `
-            --name HashTools_v3_Windows `
+            --name HashTools_v3 `
             main.py
 
-      - name: Upload Windows EXE
+      - name: Upload Windows build
         uses: actions/upload-artifact@v4
         with:
-          name: HashTools_v3_Windows
-          path: dist/HashTools_v3_Windows.exe
+          name: HashTools_v3_Windows_x64
+          path: dist/HashTools_v3/
           if-no-files-found: error
-
