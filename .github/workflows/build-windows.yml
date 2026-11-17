@@ -1,21 +1,60 @@
+
 name: Build HashTools Windows
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "**/*.py"
+      - "requirements.txt"
+      - "packaging/**"
+      - ".github/workflows/build-windows.yml"
+
+permissions:
+  contents: read
 
 jobs:
-  windows:
+  build-windows:
+    name: Build Windows x64
     runs-on: windows-latest
+    timeout-minutes: 45
+
+    defaults:
+      run:
+        shell: pwsh
 
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.12 x64
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-          architecture: x64
+          python-version: "3.12"
+          architecture: "x64"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Display environment
+        run: |
+          python --version
+          python -c "import platform; print(platform.platform()); print(platform.machine())"
+
+      - name: Verify project files
+        run: |
+          if (!(Test-Path "main.py")) {
+            throw "main.py not found"
+          }
+
+          if (!(Test-Path "requirements.txt")) {
+            throw "requirements.txt not found"
+          }
+
+          if (!(Test-Path "packaging/HashTools_Setup.iss")) {
+            throw "Inno Setup configuration not found"
+          }
 
       - name: Install dependencies
         run: |
@@ -23,8 +62,11 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install pyinstaller
 
-      - name: Build Windows executable
-        shell: pwsh
+      - name: Validate Python syntax
+        run: |
+          python -m compileall -q main.py app services
+
+      - name: Build Windows application
         run: |
           python -m PyInstaller `
             --noconfirm `
@@ -34,9 +76,69 @@ jobs:
             --name HashTools_v3 `
             main.py
 
-      - name: Upload Windows build
+      - name: Verify Windows executable
+        run: |
+          $exe = "dist/HashTools_v3/HashTools_v3.exe"
+
+          if (!(Test-Path $exe)) {
+            throw "Windows executable was not created"
+          }
+
+          Get-Item $exe | Select-Object Name, Length, FullName
+          Get-FileHash $exe -Algorithm SHA256
+
+      - name: Upload portable Windows application
         uses: actions/upload-artifact@v4
         with:
-          name: HashTools_v3_Windows_x64
+          name: HashTools_v3_Windows_x64_Portable
           path: dist/HashTools_v3/
           if-no-files-found: error
+          retention-days: 30
+
+      - name: Locate Inno Setup
+        id: inno
+        run: |
+          $paths = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+          )
+
+          $compiler = $paths |
+            Where-Object { Test-Path $_ } |
+            Select-Object -First 1
+
+          if (!$compiler) {
+            throw "Inno Setup 6 compiler not found"
+          }
+
+          "compiler=$compiler" >> $env:GITHUB_OUTPUT
+
+      - name: Build Windows installer
+        run: |
+          & "${{ steps.inno.outputs.compiler }}" `
+            "packaging/HashTools_Setup.iss"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup compilation failed"
+          }
+
+      - name: Verify installer
+        run: |
+          $installer = "installer/HashTools_v3_Setup_Windows_x64.exe"
+
+          if (!(Test-Path $installer)) {
+            throw "Windows installer was not created"
+          }
+
+          Get-Item $installer |
+            Select-Object Name, Length, FullName
+
+          Get-FileHash $installer -Algorithm SHA256
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: HashTools_v3_Windows_x64_Installer
+          path: installer/HashTools_v3_Setup_Windows_x64.exe
+          if-no-files-found: error
+          retention-days: 30
