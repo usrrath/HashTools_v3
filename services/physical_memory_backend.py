@@ -9,6 +9,7 @@ never marked as validated.
 from __future__ import annotations
 
 import hashlib
+import ctypes
 import json
 from datetime import datetime, timezone
 import os
@@ -108,26 +109,96 @@ def is_elevated():
     return os.geteuid() == 0
 
 
+def _candidate_executables(binary):
+    """Find locally supplied acquisition binaries, including PyInstaller bundles."""
+    roots = [Path(sys.executable).resolve().parent]
+    if getattr(sys, 'frozen', False):
+        roots.append(Path(getattr(sys, '_MEIPASS', roots[0])))
+    else:
+        roots.append(Path(__file__).resolve().parents[1])
+    roots.extend([Path(os.environ.get('PROGRAMFILES', 'C:/Program Files')) / 'HashTools',
+                  Path('C:/ForensicTools/WinPmem')])
+    override = os.environ.get('HASHTOOLS_WINPMEM_PATH', '').strip()
+    candidates = [Path(override)] if override else []
+    for root in roots:
+        for subdir in ('', 'tools', 'tools/winpmem', 'bin'):
+            candidates.append(root / subdir / binary)
+    located = shutil.which(binary)
+    if located:
+        candidates.append(Path(located))
+    seen = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.expanduser().resolve()
+            if resolved not in seen and resolved.is_file():
+                seen.add(resolved)
+                yield str(resolved)
+        except OSError:
+            continue
+
+
+def _pe_machine(path):
+    """Read PE COFF Machine without executing the file."""
+    try:
+        with open(path, 'rb') as stream:
+            if stream.read(2) != b'MZ':
+                return None
+            stream.seek(0x3c)
+            offset = int.from_bytes(stream.read(4), 'little')
+            if offset < 64 or offset > 16 * 1024 * 1024:
+                return None
+            stream.seek(offset)
+            if stream.read(4) != b'PE\0\0':
+                return None
+            return int.from_bytes(stream.read(2), 'little')
+    except OSError:
+        return None
+
+
 def detect_backends():
-    """Return one status record per known tool. Cheap: safe to call on every user action."""
+    """Discover installed/bundled tools; do not execute or trust arbitrary downloads."""
     system, arch = _system_arch()
     results = []
     for name, spec in TOOLS.items():
         compatible = system == spec['os'] and arch in spec['arch'] and spec['args'] is not None
-        # Report the detected binary even when incompatible, but never execute it.
-        path = shutil.which(spec['binary']) if system == spec['os'] else None
-        if compatible and path:
-            reason = spec['ready']
-        elif compatible:
-            reason = 'Not installed: place a trusted build on PATH, then press Re-check tools'
-        else:
+        candidates = list(_candidate_executables(spec['binary'])) if system == spec['os'] else []
+        path = candidates[0] if candidates else None
+        machine = _pe_machine(path) if path and system == 'Windows' else None
+        machine_ok = (machine == 0x8664) if name == 'WinPmem' and path else True
+        if not compatible:
             reason = _unsupported_reason(name, system, arch)
-        results.append({
-            'name': name, 'path': path, 'compatible': compatible,
-            'ready': bool(path and compatible), 'reason': reason,
-            'privilege': spec['privilege'],
-        })
+        elif not path:
+            reason = ('WinPmem not supplied. Bundle a verified compatible build in '
+                      'tools/winpmem or select a trusted local executable.') if name == 'WinPmem' else 'Acquisition tool not found on PATH'
+        elif not machine_ok:
+            reason = 'Executable is not a verified x64 PE binary (wrong architecture or invalid file)'
+        else:
+            reason = 'Executable located; driver compatibility and signature must be checked before acquisition'
+        results.append({'name': name, 'path': path, 'compatible': compatible,
+                        'ready': bool(path and compatible and machine_ok),
+                        'reason': reason, 'privilege': spec['privilege'],
+                        'machine': machine})
     return results
+
+
+def request_administrator_restart():
+    """Ask Windows UAC to relaunch the same application. Never bypass UAC."""
+    if os.name != 'nt':
+        raise UnsupportedCapture('Administrator restart is supported on Windows only')
+    if is_elevated():
+        return False
+    import ctypes
+    import subprocess
+    if getattr(sys, 'frozen', False):
+        executable = sys.executable
+        parameters = subprocess.list2cmdline(sys.argv[1:])
+    else:
+        executable = sys.executable
+        parameters = subprocess.list2cmdline([str(Path(sys.argv[0]).resolve()), *sys.argv[1:]])
+    result = ctypes.windll.shell32.ShellExecuteW(None, 'runas', executable, parameters, None, 1)
+    if result <= 32:
+        raise OSError(f'UAC elevation was cancelled or failed (ShellExecuteW code {result})')
+    return True
 
 
 def _format_gib(n):

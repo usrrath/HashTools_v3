@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLa
     QLineEdit, QPushButton, QFileDialog, QProgressBar, QPlainTextEdit, QTabWidget,
     QGroupBox, QMessageBox, QComboBox, QCheckBox, QSplitter, QGridLayout)
 from services.memory_capture_service import collect_response, hash_file, system_info
-from services.physical_memory_backend import detect_backends, capture_memory, IMAGE_SUFFIXES, is_elevated, native_architecture
+from services.physical_memory_backend import detect_backends, capture_memory, IMAGE_SUFFIXES, is_elevated, native_architecture, request_administrator_restart
 
 class Job(QThread):
     status = pyqtSignal(str)
@@ -69,9 +69,12 @@ class MemoryCaptureTab(QWidget):
         self.recheck = QPushButton('Re-check tools')
         self.recheck.setToolTip('Look for installed acquisition tools again without restarting HashTools.')
         self.recheck.clicked.connect(self.refresh_backends)
+        self.elevate = QPushButton('Restart as Administrator')
+        self.elevate.clicked.connect(self.restart_elevated)
         backend_row = QHBoxLayout()
         backend_row.addWidget(self.backend, 1)
         backend_row.addWidget(self.recheck)
+        backend_row.addWidget(self.elevate)
         form.addRow('Acquisition tool', backend_row)
         self.populate_backends()
         form.addRow('Acquisition method', self.mode)
@@ -213,6 +216,8 @@ class MemoryCaptureTab(QWidget):
         ready = bool(backend and backend['ready'])
         self.backend.setEnabled(physical and self.job is None)
         self.recheck.setEnabled(self.job is None)
+        self.elevate.setVisible(physical and not is_elevated())
+        self.elevate.setEnabled(self.job is None)
         self.switch_live.setVisible(physical and not ready)
         self.switch_live.setEnabled(self.job is None)
         allowed = not physical or (ready and is_elevated())
@@ -222,7 +227,7 @@ class MemoryCaptureTab(QWidget):
             if not ready:
                 reason = self._physical_unavailable_reason()
             elif not is_elevated():
-                reason = 'Restart HashTools as Administrator to capture physical RAM.'
+                reason = 'Click Restart as Administrator and accept Windows UAC; your current session will close.'
             else:
                 reason = 'Ready to start physical RAM acquisition.'
             self.start.setToolTip(reason)
@@ -276,6 +281,27 @@ class MemoryCaptureTab(QWidget):
             for label in self.system_labels.values():
                 label.setText('Unavailable')
 
+    def restart_elevated(self):
+        if self.job is not None:
+            QMessageBox.warning(self, 'Acquisition active', 'Finish or cancel the current operation before restarting.')
+            return
+        if is_elevated():
+            self.refresh_backends()
+            return
+        answer = QMessageBox.question(
+            self, 'Restart as Administrator',
+            'Windows will display a UAC permission prompt. The current HashTools session '
+            'will close after the elevated instance starts. Unsaved form values will be lost. Continue?',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            if request_administrator_restart():
+                from PyQt6.QtWidgets import QApplication
+                QApplication.instance().quit()
+        except Exception as exc:
+            QMessageBox.warning(self, 'Elevation failed', str(exc))
+
     def choose_folder(self):
         selected = QFileDialog.getExistingDirectory(self, 'Choose evidence destination', self.folder.text())
         if selected:
@@ -311,7 +337,7 @@ class MemoryCaptureTab(QWidget):
                 QMessageBox.warning(self, 'Backend unavailable', self._physical_unavailable_reason())
                 return
             if not is_elevated():
-                QMessageBox.warning(self, 'Elevation required', f"{backend['name']} needs {backend['privilege']} rights. Restart HashTools elevated.")
+                QMessageBox.warning(self, 'Elevation required', f"{backend['name']} needs {backend['privilege']} rights. Use Restart as Administrator.")
                 return
             if QMessageBox.question(self, 'Confirm physical RAM acquisition',
                     'Acquire volatile physical RAM from this authorized host? This operation changes system memory and may load a driver.') != QMessageBox.StandardButton.Yes:
