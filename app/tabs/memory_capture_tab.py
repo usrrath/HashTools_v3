@@ -2,6 +2,9 @@
 from __future__ import annotations
 import json
 import threading
+import os
+import sys
+import subprocess
 from pathlib import Path
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel,
@@ -133,6 +136,10 @@ class MemoryCaptureTab(QWidget):
         self.support = QLabel()
         self.support.setWordWrap(True)
         support_layout.addWidget(self.support)
+        self.elevate = QPushButton('Run HashTools as Administrator')
+        self.elevate.setToolTip('Windows only: request elevation using the standard UAC prompt. No security controls are bypassed.')
+        self.elevate.clicked.connect(self.request_elevation)
+        support_layout.addWidget(self.elevate)
         self.switch_live = QPushButton('Switch to available Live-Response ZIP collection')
         self.switch_live.clicked.connect(lambda: self.mode.setCurrentIndex(0))
         support_layout.addWidget(self.switch_live)
@@ -262,6 +269,8 @@ class MemoryCaptureTab(QWidget):
         self.recheck.setEnabled(self.job is None)
         self.browse_tool.setEnabled(self.job is None and physical)
         self.switch_live.setVisible(physical and not ready)
+        self.elevate.setVisible(physical and os.name == 'nt' and not is_elevated())
+        self.elevate.setEnabled(self.job is None)
         self.switch_live.setEnabled(self.job is None)
         allowed = not physical or (ready and is_elevated())
         self.start.setEnabled(self.job is None and allowed)
@@ -458,16 +467,20 @@ class MemoryCaptureTab(QWidget):
             self.log.appendPlainText(message)
 
     def on_progress(self, info):
-        if self.progress.maximum() == 0:
-            self.progress.setRange(0, 1000)
-        self.progress.setValue(int(max(0.0, min(100.0, info.get('percent', 0.0))) * 10))
+        percent = info.get('percent')
+        if percent is None:
+            self.progress.setRange(0, 0)
+        else:
+            if self.progress.maximum() == 0:
+                self.progress.setRange(0, 1000)
+            self.progress.setValue(int(max(0.0, min(100.0, float(percent))) * 10))
         label = PHASE_LABEL.get(info.get('phase'), 'Working')
         rate = info.get('rate') or 0
-        self.progress.setFormat(f"{label} %p%  ·  {format_bytes(rate)}/s  ·  ETA {format_eta(info.get('eta'))}")
+        self.progress.setFormat(f"{label} {'%p%' if percent is not None else 'in progress'}  ·  {format_bytes(rate)}/s  ·  ETA {format_eta(info.get('eta'))}")
 
     def success(self, result):
         self._outcome = 'success'
-        self._final_text = 'Completed — evidence saved and hashed'
+        self._final_text = 'Completed — evidence saved and hashed' if 'tool' in result else ('Live-response ZIP saved (partial collection; see warnings)' if result.get('partial') else 'Live-response evidence ZIP saved and hashed')
         if 'verification' in result:
             self._final_text = f"Verification result: {result['verification']}"
             if result['verification'] == 'MISMATCH':
@@ -483,7 +496,7 @@ class MemoryCaptureTab(QWidget):
             self._final_text = 'Completed — hashed (not re-read; see warnings)'
         for warning in result.get('warnings', []):
             self.log.appendPlainText('WARNING: ' + warning)
-        self.log.appendPlainText('SUCCESS:\n' + json.dumps(result, indent=2))
+        self.log.appendPlainText('RESULT:\n' + json.dumps(result, indent=2))
 
     def failure(self, message):
         self._outcome = 'failed'
@@ -507,6 +520,27 @@ class MemoryCaptureTab(QWidget):
             self.state.setText(self._final_text)
         elif self._outcome == 'failed':
             self.state.setText('Failed / cancelled — see activity log')
+
+    def request_elevation(self):
+        if os.name != 'nt' or self.job is not None or is_elevated():
+            return
+        try:
+            import ctypes
+            if getattr(sys, 'frozen', False):
+                exe, argv = sys.executable, sys.argv[1:]
+            else:
+                exe = sys.executable
+                argv = [str(Path(sys.argv[0]).resolve()), *sys.argv[1:]]
+            result = ctypes.windll.shell32.ShellExecuteW(
+                None, 'runas', exe, subprocess.list2cmdline(argv), os.getcwd(), 1)
+            if result <= 32:
+                QMessageBox.warning(self, 'Elevation unavailable',
+                    f'Windows did not start an elevated copy (result {result}).')
+            else:
+                QMessageBox.information(self, 'Elevation requested',
+                    'An elevated HashTools instance was requested. Verify Administrator: Yes in its System Information tab.')
+        except Exception as exc:
+            QMessageBox.warning(self, 'Elevation failed', f'{type(exc).__name__}: {exc}')
 
     def cancel_job(self):
         if self.job is not None:

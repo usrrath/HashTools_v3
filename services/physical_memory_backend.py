@@ -110,7 +110,7 @@ def native_architecture():
         # Windows also exposes the native architecture to emulated processes.
         arch = os.environ.get('PROCESSOR_ARCHITEW6432') or os.environ.get('PROCESSOR_ARCHITECTURE', '')
         return {'amd64': 'x86_64', 'arm64': 'arm64', 'x86': 'x86'}.get(arch.lower(), arch.lower() or 'unknown')
-    return platform.machine().lower()
+    return {'amd64': 'x86_64', 'aarch64': 'arm64'}.get(platform.machine().lower(), platform.machine().lower())
 
 
 def _system_arch():
@@ -180,6 +180,8 @@ def register_custom_tool(name, path):
     exe = Path(path).expanduser().resolve()
     if not exe.is_file():
         raise FileNotFoundError(f'Not a file: {exe}')
+    if os.name != 'nt' and not os.access(exe, os.X_OK):
+        raise PermissionError(f'Tool is not executable: {exe}')
     # The command syntax is fixed per binary name, so a renamed or different build is refused.
     if exe.name.lower() not in {b.lower() for b in spec['binaries']}:
         raise UnsupportedCapture(f'For {name} select the file named {" or ".join(spec["binaries"])}; '
@@ -201,8 +203,13 @@ def detect_backends():
         compatible = system == spec['os'] and arch in spec['arch'] and spec['args'] is not None
         # Report the detected binary even when incompatible, but never execute it.
         path, source = _find_tool(spec) if system == spec['os'] else (None, None)
-        if path is None and compatible and name in _CUSTOM_TOOLS and Path(_CUSTOM_TOOLS[name]).is_file():
+        if compatible and name in _CUSTOM_TOOLS and Path(_CUSTOM_TOOLS[name]).is_file():
             path, source = _CUSTOM_TOOLS[name], 'user-approved'
+        if compatible and path and os.name != 'nt' and not os.access(path, os.X_OK):
+            reason = f'Acquisition tool is not executable: {path}. Check file permissions.'
+            results.append({'name': name, 'path': path, 'source': source, 'compatible': True,
+                            'ready': False, 'reason': reason, 'privilege': spec['privilege']})
+            continue
         if compatible and path:
             reason = spec.get('ready_by_arch', {}).get(arch, spec['ready'])
             if source and source != 'PATH':
@@ -272,18 +279,16 @@ def _supervise(proc, dest, expected, cancelled, progress, report=None, tail=None
         except OSError:
             written = 0
         meter.update(written)
-        pct = min(99.0, written * 100.0 / expected) if expected else 0.0
-        eta = meter.eta(written, expected)
-        msg = f'Writing image: {_format_gib(written)}'
-        if expected:
-            msg += f' of ~{_format_gib(expected)} ({pct:.0f}%)'
-        msg += f' · {meter.rate / MiB:.0f} MiB/s · ETA {format_eta(eta)}'
+        # Installed RAM is not a reliable total for a sparse or segmented image.
+        # The acquisition tool has not provided a trustworthy completion percentage.
+        msg = f'Writing image: {_format_gib(written)} (completion unknown)'
+        msg += f' · {meter.rate / MiB:.0f} MiB/s · ETA unavailable'
         if tail is not None:
             msg += f' · hashed {_format_gib(tail.done)}'
         progress(msg)
         if report is not None:
-            report({'phase': 'acquire', 'done': written, 'total': expected, 'percent': pct,
-                    'rate': meter.rate, 'eta': eta, 'hashed': tail.done if tail else 0})
+            report({'phase': 'acquire', 'done': written, 'total': None, 'percent': None,
+                    'rate': meter.rate, 'eta': None, 'hashed': tail.done if tail else 0})
 
 
 def hash_image(path, cancelled=lambda: False, progress=lambda msg: None,
@@ -410,6 +415,8 @@ def capture_memory(tool, executable, output, cancelled=lambda: False, progress=l
     ``report`` receives structured progress dicts; ``progress`` receives text lines.
     """
     algos = normalise_algorithms(algorithms)
+    if 'sha256' not in algos:
+        algos = (*algos, 'sha256')  # mandatory forensic integrity digest
     spec = TOOLS.get(tool)
     backend = next((b for b in detect_backends() if b['name'] == tool), None)
     if spec is None or backend is None or not backend['compatible'] or not backend['ready']:
@@ -419,6 +426,8 @@ def capture_memory(tool, executable, output, cancelled=lambda: False, progress=l
     exe = Path(executable).expanduser().resolve()
     if not exe.is_file():
         raise FileNotFoundError(f'Acquisition executable not found: {exe}')
+    if os.name != 'nt' and not os.access(exe, os.X_OK):
+        raise PermissionError(f'Acquisition tool is not executable: {exe}')
     if exe != Path(backend['path']).resolve():
         raise UnsupportedCapture('Select the detected executable; custom binaries are not automatically trusted')
     if not is_elevated():
@@ -442,7 +451,7 @@ def capture_memory(tool, executable, output, cancelled=lambda: False, progress=l
     tool_sha256 = hash_file(exe, ('sha256',))['sha256']
     tool_version = None   # not probed: running an unverified binary with extra args has side effects; the SHA-256 identifies the build
     args = spec['args'](str(exe), str(dest))
-    progress('Starting ' + tool + ': ' + ' '.join(args))
+    progress('Starting ' + tool + ': ' + subprocess.list2cmdline(args))
     progress(f'Tool SHA-256: {tool_sha256}')
     for w in warnings:
         progress('WARNING: ' + w)
@@ -452,7 +461,7 @@ def capture_memory(tool, executable, output, cancelled=lambda: False, progress=l
         'schema_version': 2, 'case_id': case_id or None, 'examiner': examiner or None,
         'acquisition_type': 'Physical RAM', 'hostname': platform.node(),
         'operating_system': platform.system(), 'os_version': platform.version(),
-        'architecture': platform.machine(), 'cpu_model': platform.processor() or None,
+        'architecture': native_architecture(), 'process_architecture': platform.machine(), 'cpu_model': platform.processor() or None,
         'total_ram_bytes': expected, 'acquisition_tool': tool, 'acquisition_tool_version': tool_version,
         'tool_path': str(exe), 'tool_sha256': tool_sha256, 'tool_source': backend.get('source'),
         'elevated': True, 'output_filename': dest.name, 'acquisition_start': started_at,
@@ -483,8 +492,8 @@ def capture_memory(tool, executable, output, cancelled=lambda: False, progress=l
         if not dest.is_file() or dest.stat().st_size == 0:
             raise RuntimeError('Acquisition returned success but no nonempty memory image was produced')
         size = dest.stat().st_size
-        progress(f'Acquisition complete ({_format_gib(size)} in {acquisition_seconds:.0f} s). '
-                 'Finishing hash of the streamed image…')
+        progress(f'Acquisition complete ({_format_gib(size)} in {acquisition_seconds:.0f} s).')
+        progress(f'Hashing: finalizing streamed digests for {_format_gib(size)}')
         hash_started = time.monotonic()
         tail.request_finish()
         meter = RateMeter()
