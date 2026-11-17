@@ -1,4 +1,3 @@
-
 #define MyAppName "HashTools v3"
 #define MyAppVersion "3.0"
 #define MyAppPublisher "HashTools"
@@ -20,3 +19,19 @@ PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\{#MyAppExeName}
+
+[Languages]
+Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[Tasks]
+Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional icons:"
+
+[Files]
+Source: "..\dist\HashTools_v3\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[Icons]
+Name: "{group}\HashTools v3"; Filename: "{app}\{#MyAppExeName}"
+Name: "{autodesktop}\HashTools v3"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+
+[Run]
+Filename: "{app}\{#MyAppExeName}"; Description: "Launch HashTools v3"; Flags: nowait postinstall skipifsilent
