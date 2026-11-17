@@ -1,0 +1,19 @@
+# Runtime dependencies (tested with the versions in brackets).
+PyQt6>=6.6,<7            # [6.12.0] GPL v3 / commercial
+Pillow>=10,<13           # [12.3.0] HPND
+# Optional: rendered Office pages. NOTE: PyMuPDF is AGPL-3.0 (or commercial licence);
+# confirm this is acceptable before distributing the application. Without it,
+# QtPdf (shipped with PyQt6) or the text-only fallback is used.
+PyMuPDF>=1.24,<3         # [2.1] AGPL-3.0
+# python-docx, python-pptx and openpyxl were removed: Office text is read with zipfile/ElementTree.
+
+# Screen evidence recording
+mss>=9,<11
+imageio-ffmpeg>=0.5,<1
+reportlab>=4.0,<5
+
+# Fast BLAKE3 hashing (b3sum compatible digest)
+blake3>=1.0,<2
+
+# Memory Capture host telemetry
+psutil>=5.9,<8
