@@ -1,14 +1,14 @@
-<CodeBlock language="ini" editable>
+
 #define MyAppName "HashTools v3"
 #define MyAppVersion "3.0"
+#define MyAppPublisher "HashTools"
 #define MyAppExeName "HashTools_v3.exe"
-
 
 [Setup]
 AppId={{E84E4A9D-7F2A-48F1-B72D-BC238BE231A7}}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
-AppPublisher=HashTools
+AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\HashTools
 DefaultGroupName=HashTools
 OutputDir=..\installer
@@ -19,7 +19,8 @@ WizardStyle=modern
 PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-UninstallDisplayIcon={app}{#MyAppExeName}
+UninstallDisplayIcon={app}\{#MyAppExeName}
+DisableProgramGroupPage=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -28,12 +29,11 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional icons:"
 
 [Files]
-Source: "..\dist\HashTools_v3*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\dist\HashTools_v3\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\HashTools v3"; Filename: "{app}{#MyAppExeName}"
-Name: "{autodesktop}\HashTools v3"; Filename: "{app}{#MyAppExeName}"; Tasks: desktopicon
+Name: "{group}\HashTools v3"; Filename: "{app}\{#MyAppExeName}"
+Name: "{autodesktop}\HashTools v3"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}{#MyAppExeName}"; Description: "Launch HashTools v3"; Flags: nowait postinstall skipifsilent
-</CodeBlock>
+Filename: "{app}\{#MyAppExeName}"; Description: "Launch HashTools v3"; Flags: nowait postinstall skipifsilent

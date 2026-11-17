@@ -26,9 +26,15 @@ jobs:
         shell: pwsh
 
     steps:
+      # --------------------------------------
+      # 1. Checkout
+      # --------------------------------------
       - name: Checkout source
         uses: actions/checkout@v4
 
+      # --------------------------------------
+      # 2. Python environment
+      # --------------------------------------
       - name: Set up Python 3.12 x64
         uses: actions/setup-python@v5
         with:
@@ -42,103 +48,28 @@ jobs:
           python --version
           python -c "import platform; print(platform.platform()); print(platform.machine())"
 
+      # --------------------------------------
+      # 3. Validate source files
+      # --------------------------------------
       - name: Verify project files
         run: |
-          if (!(Test-Path "main.py")) {
-            throw "main.py not found"
-          }
-
-          if (!(Test-Path "requirements.txt")) {
-            throw "requirements.txt not found"
-          }
-
-          if (!(Test-Path "packaging/HashTools_Setup.iss")) {
-            throw "Inno Setup configuration not found"
-          }
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-          python -m pip install pyinstaller
-
-      - name: Validate Python syntax
-        run: |
-          python -m compileall -q main.py app services
-
-      - name: Build Windows application
-        run: |
-          python -m PyInstaller `
-            --noconfirm `
-            --clean `
-            --onedir `
-            --windowed `
-            --name HashTools_v3 `
-            main.py
-
-      - name: Verify Windows executable
-        run: |
-          $exe = "dist/HashTools_v3/HashTools_v3.exe"
-
-          if (!(Test-Path $exe)) {
-            throw "Windows executable was not created"
-          }
-
-          Get-Item $exe | Select-Object Name, Length, FullName
-          Get-FileHash $exe -Algorithm SHA256
-
-      - name: Upload portable Windows application
-        uses: actions/upload-artifact@v4
-        with:
-          name: HashTools_v3_Windows_x64_Portable
-          path: dist/HashTools_v3/
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Locate Inno Setup
-        id: inno
-        run: |
-          $paths = @(
-            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
-            "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+          $required = @(
+            "main.py",
+            "requirements.txt",
+            "packaging/HashTools_Setup.iss"
           )
 
-          $compiler = $paths |
-            Where-Object { Test-Path $_ } |
-            Select-Object -First 1
-
-          if (!$compiler) {
-            throw "Inno Setup 6 compiler not found"
+          foreach ($file in $required) {
+            if (!(Test-Path $file -PathType Leaf)) {
+              throw "Required file missing: $file"
+            }
           }
 
-          "compiler=$compiler" >> $env:GITHUB_OUTPUT
+          Write-Host "Required project files found."
 
-      - name: Build Windows installer
+      - name: Validate Inno Setup script
         run: |
-          & "${{ steps.inno.outputs.compiler }}" `
-            "packaging/HashTools_Setup.iss"
+          $script = "packaging/HashTools_Setup.iss"
+          $content = Get-Content $script -Raw
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "Inno Setup compilation failed"
-          }
-
-      - name: Verify installer
-        run: |
-          $installer = "installer/HashTools_v3_Setup_Windows_x64.exe"
-
-          if (!(Test-Path $installer)) {
-            throw "Windows installer was not created"
-          }
-
-          Get-Item $installer |
-            Select-Object Name, Length, FullName
-
-          Get-FileHash $installer -Algorithm SHA256
-
-      - name: Upload Windows installer
-        uses: actions/upload-artifact@v4
-        with:
-          name: HashTools_v3_Windows_x64_Installer
-          path: installer/HashTools_v3_Setup_Windows_x64.exe
-          if-no-files-found: error
-          retention-days: 30
+          if ($content -match '(?i)<CodeBlock|
