@@ -11,9 +11,12 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLa
     QLineEdit, QPushButton, QFileDialog, QProgressBar, QPlainTextEdit, QTabWidget,
     QGroupBox, QMessageBox, QComboBox, QCheckBox, QSplitter, QGridLayout)
 from datetime import datetime
-from services.memory_capture_service import collect_response, system_info
+from services.memory.live_response_collector import collect_response, system_info
 from services.memory_hashing import hash_file as sha256_of, format_bytes, format_eta
-from services.physical_memory_backend import (detect_backends, capture_memory, verify_image, register_custom_tool,
+from services.memory.tool_registry import detect_backends, register_custom_tool
+from services.memory.acquisition_manager import acquire as capture_memory
+from services.memory.acquisition_verifier import verify as verify_image
+from services.physical_memory_backend import (
     IMAGE_SUFFIXES, is_elevated, native_architecture, UnsupportedCapture, sidecar_paths)
 
 class Job(QThread):
