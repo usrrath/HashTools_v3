@@ -17,3 +17,6 @@ blake3>=1.0,<2
 
 # Memory Capture host telemetry
 psutil>=5.9,<8
+
+# Bundled Volatility 3 core dependency
+pefile>=2024.8.26

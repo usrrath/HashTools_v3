@@ -171,6 +171,9 @@ class MemoryCaptureTab(QWidget):
         capture_layout.addLayout(buttons)
         capture_layout.addStretch(1)
         self.tabs.addTab(capture, 'Live Capture')
+        from app.tabs.volatility_capture_panel import VolatilityCapturePanel
+        self.volatility_panel = VolatilityCapturePanel()
+        self.tabs.addTab(self.volatility_panel, 'Volatility 3 Analysis')
         inspect = QWidget()
         inspect_layout = QVBoxLayout(inspect)
         verify_group = QGroupBox('Read-only memory image integrity check')
