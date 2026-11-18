@@ -167,7 +167,13 @@ class CaptureTests(unittest.TestCase):
 
     def test_cancel_stops_process_and_keeps_partial(self):
         stop = threading.Event()
-        threading.Timer(0.8, stop.set).start()
+        def cancel_after_partial():
+            image = self.out_dir / 'mem.lime'
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline and not image.exists():
+                time.sleep(0.05)
+            stop.set()
+        threading.Thread(target=cancel_after_partial, daemon=True).start()
         started = time.monotonic()
         with mock.patch.dict(os.environ, {'FAKE_MODE': 'hang'}):
             with self.assertRaises(InterruptedError):

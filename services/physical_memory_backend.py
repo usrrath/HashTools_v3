@@ -47,6 +47,7 @@ IMAGE_SUFFIXES = ('.mem', '.ram', '.raw', '.lime', '.aff4', '.dmp', '.vmem')
 MIN_EXPECTED_FRACTION = 0.5
 # Images are a little larger than RAM on some tools (headers / LiME segment records).
 FREE_SPACE_MARGIN = 1.02
+STALL_WARNING_SECONDS = 30.0
 FAT_LIMIT = 4 * GiB - 1
 _FAT_TYPES = {'fat', 'fat32', 'vfat', 'msdos'}
 _SIGKILL = getattr(signal, 'SIGKILL', signal.SIGTERM)
@@ -70,6 +71,9 @@ TOOLS = {
         args=lambda exe, dest: [exe, '-o', dest],  # AFF4 output; do not pass destination as positional input
         privilege='Administrator',
         ready='Ready (verify build and privileges before acquisition)',
+        # AFF4 is a ZIP-based container: segments/indexes are finalised out of order, so a hash
+        # taken while it is written can never be used. Do not burn CPU computing it.
+        streamable=False,
     ),
     'AVML': dict(
         binary='avml', binaries=('avml',), patterns=(),
@@ -77,6 +81,7 @@ TOOLS = {
         args=lambda exe, dest: [exe, dest],          # LiME output, uncompressed
         privilege='root',
         ready='Ready (verify build and privileges before acquisition)',
+        streamable=True,   # LiME is written strictly front to back
         ready_by_arch={'aarch64': 'Ready on aarch64: confirm your AVML build supports this architecture',
                        'arm64': 'Ready on aarch64: confirm your AVML build supports this architecture'},
     ),
@@ -260,6 +265,7 @@ def _supervise(proc, dest, expected, cancelled, progress, report=None, tail=None
     """Wait for the tool, reporting size/rate/ETA twice a second and honouring cancellation."""
     last = 0.0
     meter = RateMeter()
+    grew_at, seen, warned = time.monotonic(), -1, False
     while True:
         try:
             proc.wait(timeout=0.1)      # returns the moment the tool exits
@@ -279,6 +285,12 @@ def _supervise(proc, dest, expected, cancelled, progress, report=None, tail=None
         except OSError:
             written = 0
         meter.update(written)
+        if written != seen:
+            grew_at, seen, warned = now, written, False
+        elif not warned and now - grew_at >= STALL_WARNING_SECONDS:
+            warned = True
+            progress(f'WARNING: image size has not changed for {STALL_WARNING_SECONDS:.0f} s '
+                     f'({_format_gib(written)}); the tool may be stalled or blocked. It is NOT being stopped.')
         # Installed RAM is not a reliable total for a sparse or segmented image.
         # The acquisition tool has not provided a trustworthy completion percentage.
         msg = f'Writing image: {_format_gib(written)} (completion unknown)'
@@ -311,7 +323,7 @@ def hash_image(path, cancelled=lambda: False, progress=lambda msg: None,
                      f'({info["percent"]:.0f}%) · {info["rate"] / MiB:.0f} MiB/s · '
                      f'ETA {format_eta(info["eta"])}')
 
-    return hash_file(path, algorithms, cancelled, relay)
+    return hash_file(path, algorithms, cancelled, relay, evict=True)
 
 
 def sidecar_paths(dest):
@@ -366,6 +378,25 @@ def _utc():
 def _write_new(path, text):
     with path.open('x', encoding='utf-8') as f:
         f.write(text)
+        f.flush()
+        os.fsync(f.fileno())      # a power loss right after acquisition must not lose the record
+
+
+def flush_image(path):
+    """Force the finished image to stable storage so a later read-back is of the disk, not of
+    dirty cache. Returns True when the OS accepted the flush (Windows refuses on a read-only
+    handle; the caller then reports the verification as cache-assisted)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_BINARY', 0))
+    except OSError:
+        return False
+    try:
+        os.fsync(fd)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
 
 
 def _write_summary(path, meta, hashes, verified, source):
@@ -388,7 +419,9 @@ def _write_summary(path, meta, hashes, verified, source):
             lines.append(f"{algo.upper() + ' checksum:':<20}{hashes[algo]}")
     lines += ['', f'Hash source:        {source}',
               'Verification:       ' + ('re-read of the finished image confirmed the streamed SHA-256'
-                                         if verified else 'NOT independently re-read'),
+                                         if verified else
+                                         'digests computed by a full read of the finished image' if source == 're-read'
+                                         else 'NOT independently re-read'),
               '', 'Notes:']
     lines += [f'  - {w}' for w in meta['warnings']]
     _write_new(path, '\n'.join(lines) + '\n')
@@ -404,13 +437,49 @@ def _record_outcome(paths, base, status, error):
         pass   # never mask the original failure
 
 
+def classify_acquisition_failure(log_text: str, exit_code: int | None = None) -> dict:
+    """Classify observed tool output; never infer driver trust from an executable name."""
+    low = log_text.casefold()
+    policy_phrases = (
+        'an application control policy has blocked this file',
+        'blocked by group policy',
+        'blocked by your system administrator',
+        'blocked by application control',
+    )
+    if any(phrase in low for phrase in policy_phrases):
+        return {
+            'code': 'WINDOWS_DRIVER_POLICY_BLOCKED',
+            'title': 'WINDOWS APPLICATION CONTROL BLOCKED the acquisition driver',
+            'guidance': (
+                'The WinPmem kernel driver could not start; changing .aff4 to .mem or .ram does not fix this. Administrator elevation and '
+                'changing the output extension cannot override this policy. '
+                'Review Microsoft-Windows-CodeIntegrity/Operational and '
+                'Microsoft-Windows-AppLocker/EXE and DLL event logs around the failure time. '
+                'Have an authorized security administrator assess the exact driver identity, '
+                'signature, and applicable WDAC/App Control policy; use an approved, '
+                'compatible acquisition tool or collect Live-Response ZIP instead. '
+                'Do not disable security controls. No complete RAM image was acquired.'
+            ),
+            'retry_same_tool': False,
+        }
+    if 'access is denied' in low or 'permission denied' in low:
+        return {'code': 'PERMISSION_DENIED', 'title': 'Permission denied',
+                'guidance': 'Check the tool permissions and administrator/root privileges.',
+                'retry_same_tool': False}
+    if 'not enough space' in low or 'disk full' in low:
+        return {'code': 'INSUFFICIENT_STORAGE', 'title': 'Evidence destination is full',
+                'guidance': 'Select an evidence volume with sufficient free space.',
+                'retry_same_tool': False}
+    return {'code': 'ACQUISITION_TOOL_FAILED', 'title': 'Acquisition tool failed',
+            'guidance': ('Inspect the full acquisition log and confirm the exact tool build, '
+                         'command, driver support and destination format before retrying.'),
+            'retry_same_tool': True}
+
+
 def _tool_failure_details(log_path, exit_code):
-    """Explain external acquisition failures without guessing driver-specific causes."""
-    signed = exit_code
-    if os.name == 'nt' and isinstance(exit_code, int):
-        signed = ((exit_code + 2**31) % 2**32) - 2**31
+    """Include bounded tool output and an actionable, evidence-based error category."""
+    signed = ((exit_code + 2**31) % 2**32) - 2**31 if isinstance(exit_code, int) else exit_code
     try:
-        # Read only the last 64 KiB: tool logs can be very large.
         with open(log_path, 'rb') as handle:
             handle.seek(0, os.SEEK_END)
             handle.seek(max(0, handle.tell() - 65536))
@@ -418,29 +487,13 @@ def _tool_failure_details(log_path, exit_code):
         lines = [line.strip() for line in tail.splitlines() if line.strip()]
         excerpt = '\n'.join(lines[-12:])
     except OSError as exc:
+        tail = ''
         excerpt = f'Unable to read acquisition log: {exc}'
-    blocked = ('an application control policy has blocked this file' in tail.lower() or
-               'blocked by group policy' in tail.lower() or
-               'blocked by your system administrator' in tail.lower())
-    if blocked:
-        guidance = (
-            'WINDOWS APPLICATION CONTROL BLOCKED THE WINPMEM DRIVER. '
-            'The command reached driver initialization; changing .aff4 to .mem or .ram '
-            'will not resolve this failure. Preserve Windows security settings. '
-            'Ask the organization security administrator to review the Code Integrity / '
-            'App Control event logs and approve a properly signed, compatible acquisition '
-            'tool through the organization\'s authorized policy process, or use Live-Response ZIP. '
-            'No complete physical RAM image was acquired.'
-        )
-    else:
-        guidance = (
-        'Check the tool command and supported output format first. '
-        'If driver initialization fails, confirm that the tool and signed driver support this Windows '
-        'kernel and security configuration. Do not disable Windows security protections. '
-        'If no compatible driver is available, use Live-Response ZIP collection.'
-        )
-    return (f'Acquisition tool exited with code {exit_code} (signed {signed}). '
-            f'Log: {log_path}\nLast tool output:\n{excerpt or "(no diagnostic output)"}\n{guidance}')
+    issue = classify_acquisition_failure(tail, exit_code)
+    return (f'{issue["code"]}: {issue["title"]}. '
+            f'Acquisition tool exited with code {exit_code} (signed {signed}). '
+            f'Log: {log_path}\nLast tool output:\n{excerpt or "(no diagnostic output)"}\n'
+            f'{issue["guidance"]}')
 
 
 def capture_memory(tool, executable, output, cancelled=lambda: False, progress=lambda msg: None,
@@ -517,8 +570,13 @@ def capture_memory(tool, executable, output, cancelled=lambda: False, progress=l
         logfile.close()
         paths['log'].unlink(missing_ok=True)   # nothing ran; do not leave an empty log behind
         raise
-    tail = TailHasher(dest, algos)
-    tail.start()
+    streamable = spec.get('streamable', False)
+    tail = TailHasher(dest, algos) if streamable else None
+    if tail is not None:
+        tail.start()
+    else:
+        progress(f'{tool} writes a container that cannot be hashed while it is written: '
+                 'digests will be computed by one full read after acquisition.')
     try:
         with logfile:
             try:
@@ -533,26 +591,30 @@ def capture_memory(tool, executable, output, cancelled=lambda: False, progress=l
             raise RuntimeError('Acquisition returned success but no nonempty memory image was produced')
         size = dest.stat().st_size
         progress(f'Acquisition complete ({_format_gib(size)} in {acquisition_seconds:.0f} s).')
-        progress(f'Hashing: finalizing streamed digests for {_format_gib(size)}')
         hash_started = time.monotonic()
-        tail.request_finish()
-        meter = RateMeter()
-        while tail.is_alive():                 # normally already (almost) caught up
-            tail.join(0.2)
-            if cancelled():
-                raise InterruptedError('Hashing cancelled; the image was not validated')
-            if report is not None:
-                meter.update(tail.done)
-                report({'phase': 'hash', 'done': tail.done, 'total': size,
-                        'percent': min(100.0, tail.done * 100.0 / size), 'rate': meter.rate,
-                        'eta': meter.eta(tail.done, size)})
-        streamed = tail.digests
+        streamed = None
+        if tail is not None:
+            progress(f'Hashing: finalizing streamed digests for {_format_gib(size)}')
+            tail.request_finish()
+            meter = RateMeter()
+            while tail.is_alive():                 # normally already (almost) caught up
+                tail.join(0.2)
+                if cancelled():
+                    raise InterruptedError('Hashing cancelled; the image was not validated')
+                if report is not None:
+                    meter.update(tail.done)
+                    report({'phase': 'hash', 'done': tail.done, 'total': size,
+                            'percent': min(100.0, tail.done * 100.0 / size), 'rate': meter.rate,
+                            'eta': meter.eta(tail.done, size)})
+            streamed = tail.digests
     except InterruptedError as exc:
-        tail.abort()
+        if tail is not None:
+            tail.abort()
         _record_outcome(paths, base, 'cancelled', exc)
         raise
     except BaseException as exc:
-        tail.abort()
+        if tail is not None:
+            tail.abort()
         _record_outcome(paths, base, 'failed', exc)
         raise
 
@@ -561,14 +623,15 @@ def capture_memory(tool, executable, output, cancelled=lambda: False, progress=l
         warnings.append(f'Image is {size / expected:.0%} of installed RAM; the acquisition may be incomplete. '
                         f'Review {paths["log"].name} before relying on it.')
     verified, source, verify_seconds = False, 'streamed', 0.0
+    flushed = flush_image(dest)          # make the read-back below come from stable storage
     try:
-        usable = (tool != 'WinPmem' and streamed is not None and tail.valid
-                  and tail.done == size == dest.stat().st_size)  # AFF4 ZIP may rewrite headers
+        usable = (tail is not None and streamed is not None and tail.valid
+                  and tail.done == size == dest.stat().st_size and tail.head_intact())
         if usable and verify:
             vt = time.monotonic()
             algo = 'sha256' if 'sha256' in algos else algos[0]
-            progress(f'Verifying: re-reading the finished image ({algo.upper()})…')
-            check = hash_file(dest, (algo,), cancelled, report, phase='verify')
+            progress(f'Verifying: re-reading the finished image from disk ({algo.upper()})…')
+            check = hash_file(dest, (algo,), cancelled, report, phase='verify', evict=True)
             verify_seconds = time.monotonic() - vt
             if check[algo] == streamed[algo]:
                 hashes, verified, source = streamed, True, 'streamed, confirmed by re-read'
@@ -576,15 +639,21 @@ def capture_memory(tool, executable, output, cancelled=lambda: False, progress=l
                 warnings.append(f'{algo.upper()} of the finished file differs from the hash computed while '
                                 'writing (the tool may write non-sequentially, or the file changed). '
                                 'Full re-read digests are reported.')
-                hashes, source = hash_file(dest, algos, cancelled, report, phase='verify'), 're-read'
+                hashes, source = hash_file(dest, algos, cancelled, report, phase='verify', evict=True), 're-read'
         elif usable:
             hashes = streamed
             warnings.append('Verification re-read was skipped: digests were computed while the tool was '
                             'writing and assume sequential output.')
         else:
-            warnings.append('Streamed hashing was not usable (file size changed or tool wrote out of order); '
-                            'digests come from a full re-read.')
-            hashes, source = hash_file(dest, algos, cancelled, report, phase='verify'), 're-read'
+            if streamable:
+                warnings.append('Streamed hashing was not usable (file size changed, header was rewritten or '
+                                'tool wrote out of order); digests come from a full re-read.')
+            else:
+                progress(f'Hashing: reading the finished image ({_format_gib(size)})…')
+            hashes, source = hash_file(dest, algos, cancelled, report, phase='verify', evict=True), 're-read'
+        if (usable and verify or source == 're-read') and not flushed:
+            warnings.append('Could not force the image to stable storage before read-back; the verification '
+                            'may have been served from the operating-system cache.')
     except InterruptedError as exc:
         _record_outcome(paths, base, 'cancelled_during_verification', exc)
         raise

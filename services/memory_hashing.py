@@ -11,6 +11,13 @@ Design
 * A window is shared by all digests (no per-digest copy).
 * ``TailHasher`` hashes a file *while another process is still writing it*, which is what
   removes the long "hash after capture" wait of a conventional acquire-then-hash flow.
+* Digests are packed onto ``min(#digests, #CPUs)`` worker threads, balanced by *measured*
+  per-digest cost (``_algo_costs``). One thread per digest oversubscribes small machines:
+  on 2 cores MD5+SHA-1+SHA-256 needed 3 runnable threads plus the reader.
+* Evidence reads are page-cache friendly (``open_sequential`` / ``CacheTrimmer``): a RAM
+  image is as large as RAM, so letting it pile up in the page cache both evicts the live
+  system's memory (the thing being acquired) and makes a "verification" re-read come from
+  RAM instead of from the disk the evidence actually sits on.
 """
 from __future__ import annotations
 
@@ -26,6 +33,7 @@ DEFAULT_ALGORITHMS = ('md5', 'sha256')
 # Measured on 2 vCPUs: 1-8 MiB windows are equivalent, 16 MiB is ~9% slower.
 WINDOW = 4 * 1024 * 1024
 QUEUE_DEPTH = 8
+HEAD_GUARD = 1024 * 1024      # bytes of file head re-checked after streaming
 _NEVER = lambda: False  # noqa: E731
 
 
@@ -40,32 +48,117 @@ def normalise_algorithms(algorithms):
     return chosen
 
 
+_FADV = {k: getattr(os, 'POSIX_FADV_' + k, None) for k in ('SEQUENTIAL', 'DONTNEED')}
+TRIM_BYTES = 128 * 1024 * 1024      # flush + evict consumed pages this often
+
+
+def open_sequential(path):
+    """Unbuffered read-only handle tuned for one forward pass over a huge file."""
+    flags = os.O_RDONLY | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_SEQUENTIAL', 0)
+    fd = os.open(path, flags)
+    if _FADV['SEQUENTIAL'] is not None:
+        try:
+            os.posix_fadvise(fd, 0, 0, _FADV['SEQUENTIAL'])
+        except OSError:
+            pass            # advisory only: some filesystems / network mounts refuse it
+    try:
+        return os.fdopen(fd, 'rb', buffering=0)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+class CacheTrimmer:
+    """Keep a streaming read from filling the page cache (Linux/POSIX; a no-op elsewhere).
+
+    Every ``TRIM_BYTES`` consumed, dirty pages of the file are flushed (``fdatasync`` works on
+    a read-only descriptor) and the consumed range is dropped with ``POSIX_FADV_DONTNEED``.
+    Purely advisory: failures are ignored and never change what is read or hashed.
+    """
+
+    def __init__(self, handle, enabled=True):
+        self.fd = handle.fileno()
+        self.enabled = bool(enabled and _FADV['DONTNEED'] is not None and hasattr(os, 'fdatasync'))
+        self._dropped = 0
+
+    def update(self, done, final=False):
+        if not self.enabled or (done - self._dropped < TRIM_BYTES and not final):
+            return
+        try:
+            os.fdatasync(self.fd)
+            os.posix_fadvise(self.fd, self._dropped, done - self._dropped, _FADV['DONTNEED'])
+            self._dropped = done
+        except OSError:
+            self.enabled = False
+
+
+_COSTS = {}
+
+
+def _algo_costs():
+    """Relative CPU seconds per byte of each digest on THIS machine (measured once, ~10 ms).
+
+    SHA-NI hosts hash SHA-1/SHA-256 much faster than MD5; older CPUs invert that, so a fixed
+    table would balance the worker threads badly."""
+    if not _COSTS:
+        probe = bytes(1024 * 1024)
+        for a in HASH_ALGORITHMS:
+            best = float('inf')
+            for _ in range(3):
+                h = hashlib.new(a)
+                t = time.perf_counter()
+                for _ in range(2):
+                    h.update(probe)
+                best = min(best, time.perf_counter() - t)
+            _COSTS[a] = max(best, 1e-9)
+    return _COSTS
+
+
+def plan_workers(algorithms, cpus=None):
+    """Greedy longest-processing-time packing of digests onto ``min(len, cpus)`` threads."""
+    cpus = max(1, cpus or os.cpu_count() or 1)
+    algorithms = tuple(algorithms)
+    n = min(len(algorithms), cpus)
+    if n >= len(algorithms):
+        return [[a] for a in algorithms]
+    costs = _algo_costs()
+    bins = [[0.0, []] for _ in range(n)]
+    for a in sorted(algorithms, key=lambda x: -costs[x]):
+        lightest = min(bins, key=lambda b: b[0])
+        lightest[0] += costs[a]
+        lightest[1].append(a)
+    return [b[1] for b in bins if b[1]]
+
+
 class MultiHasher:
     """Feed ``bytes`` windows to several digests in parallel with bounded memory."""
 
-    def __init__(self, algorithms=DEFAULT_ALGORITHMS):
+    def __init__(self, algorithms=DEFAULT_ALGORITHMS, cpus=None):
         self.algorithms = normalise_algorithms(algorithms)
         self._digests = {a: hashlib.new(a) for a in self.algorithms}
-        self._queues = {a: queue.Queue(QUEUE_DEPTH) for a in self.algorithms}
-        self._threads = [threading.Thread(target=self._worker, args=(a,), daemon=True,
-                                          name=f'hash-{a}') for a in self.algorithms]
+        self.plan = plan_workers(self.algorithms, cpus)
+        self._queues = [queue.Queue(QUEUE_DEPTH) for _ in self.plan]
+        self._threads = [threading.Thread(target=self._worker, args=(group, q), daemon=True,
+                                          name='hash-' + '+'.join(group))
+                         for group, q in zip(self.plan, self._queues)]
         self.bytes_fed = 0
         self._closed = False
         for t in self._threads:
             t.start()
 
-    def _worker(self, algo):
-        digest, q = self._digests[algo], self._queues[algo]
+    def _worker(self, group, q):
+        digests = [self._digests[a] for a in group]
         while True:
             chunk = q.get()
             if chunk is None:
                 return
-            digest.update(chunk)
+            for d in digests:
+                d.update(chunk)
 
     def feed(self, chunk):
         if self._closed:
             raise ValueError('hasher already finished')
-        for q in self._queues.values():       # blocks when the slowest digest lags: backpressure
+        for q in self._queues:       # blocks when the slowest worker lags: backpressure
             q.put(chunk)
         self.bytes_fed += len(chunk)
 
@@ -73,11 +166,11 @@ class MultiHasher:
         """Flush all workers and return ``{algorithm: hexdigest}``. Idempotent."""
         if not self._closed:
             self._closed = True
-            for q in self._queues.values():
+            for q in self._queues:
                 q.put(None)
             for t in self._threads:
                 t.join()
-        return {a: d.hexdigest() for a, d in self._digests.items()}
+        return {a: self._digests[a].hexdigest() for a in self.algorithms}
 
     close = finish   # on abort the result is simply discarded
 
@@ -121,11 +214,12 @@ def format_eta(seconds):
 
 
 def hash_file(path, algorithms=DEFAULT_ALGORITHMS, cancelled=_NEVER, report=None, phase='hash',
-              window=WINDOW):
+              window=WINDOW, evict=False):
     """Read ``path`` once (read-only) and return ``{algorithm: hexdigest}``.
 
     ``report`` receives ``{'phase', 'done', 'total', 'rate', 'eta'}`` about twice a second.
-    Raises ``InterruptedError`` if ``cancelled()`` turns true.
+    Raises ``InterruptedError`` if ``cancelled()`` turns true. ``evict=True`` drops the pages
+    already hashed from the page cache (use for RAM images; see :class:`CacheTrimmer`).
     """
     total = os.path.getsize(path)
     hasher = MultiHasher(algorithms)
@@ -133,7 +227,8 @@ def hash_file(path, algorithms=DEFAULT_ALGORITHMS, cancelled=_NEVER, report=None
     last = 0.0
     done = 0
     try:
-        with open(path, 'rb', buffering=0) as f:
+        with open_sequential(path) as f:
+            trim = CacheTrimmer(f, evict)
             while True:
                 if cancelled():
                     raise InterruptedError('Hashing cancelled; the image was not validated')
@@ -142,6 +237,7 @@ def hash_file(path, algorithms=DEFAULT_ALGORITHMS, cancelled=_NEVER, report=None
                     break
                 hasher.feed(chunk)
                 done += len(chunk)
+                trim.update(done)
                 now = time.monotonic()
                 if report is not None and now - last >= 0.5:
                     last = now
@@ -149,6 +245,7 @@ def hash_file(path, algorithms=DEFAULT_ALGORITHMS, cancelled=_NEVER, report=None
                     report({'phase': phase, 'done': done, 'total': total,
                             'percent': (done * 100.0 / total) if total else 100.0,
                             'rate': meter.rate, 'eta': meter.eta(done, total)})
+            trim.update(done, final=True)
     except BaseException:
         hasher.close()
         raise
@@ -169,8 +266,12 @@ class TailHasher(threading.Thread):
     with :attr:`done`. A later full re-read is the authoritative check.
     """
 
-    def __init__(self, path, algorithms=DEFAULT_ALGORITHMS, window=WINDOW):
+    def __init__(self, path, algorithms=DEFAULT_ALGORITHMS, window=WINDOW, evict=True):
         super().__init__(daemon=True, name='tail-hash')
+        self.evict = evict
+        self._head = hashlib.sha256()
+        self._head_len = 0
+        self.head = None            # (length, sha256) of the first HEAD_GUARD bytes as first seen
         self.path = Path(path)
         self.window = window
         self.hasher = MultiHasher(algorithms)
@@ -201,7 +302,7 @@ class TailHasher(threading.Thread):
         try:
             while f is None:
                 try:
-                    f = open(self.path, 'rb', buffering=0)
+                    f = open_sequential(self.path)
                 except (FileNotFoundError, PermissionError):
                     # Not created yet, or the writer has not granted read sharing yet (Windows):
                     # keep retrying. Once the writer has exited the file opens normally and is
@@ -225,7 +326,35 @@ class TailHasher(threading.Thread):
             else:
                 self.digests = self.hasher.finish()
 
+    def head_intact(self):
+        """Cheap guard for non-sequential writers: are the first bytes still what we hashed
+        while streaming? Tools that patch a header at the end (container formats) fail this
+        immediately; it cannot prove the *middle* is unchanged, which only a re-read can."""
+        if self.head is None:
+            return False
+        length, digest = self.head
+        try:
+            with open_sequential(self.path) as f:
+                return hashlib.sha256(f.read(length)).hexdigest() == digest
+        except OSError:
+            return False
+
+    def _note_head(self, chunk):
+        if self._head_len < HEAD_GUARD:
+            part = chunk[:HEAD_GUARD - self._head_len]
+            self._head.update(part)
+            self._head_len += len(part)
+
     def _drain(self, f):
+        trim = CacheTrimmer(f, self.evict)
+        try:
+            self._drain_loop(f, trim)
+        finally:
+            if self.head is None and self._head_len:
+                self.head = (self._head_len, self._head.hexdigest())
+            trim.update(self.done, final=True)
+
+    def _drain_loop(self, f, trim):
         while not self._abort.is_set():
             # Sample the flag BEFORE reading: if the writer had already exited, an empty
             # read is a true EOF; otherwise bytes may still arrive, so keep polling.
@@ -233,7 +362,9 @@ class TailHasher(threading.Thread):
             chunk = f.read(self.window)
             if chunk:
                 self.hasher.feed(chunk)
+                self._note_head(chunk)
                 self.done += len(chunk)
+                trim.update(self.done)
                 continue
             if os.fstat(f.fileno()).st_size < self.done:
                 self.valid = False          # file shrank/was truncated under us
