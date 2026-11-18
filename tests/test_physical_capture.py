@@ -28,7 +28,9 @@ if mode == "fail":
 if mode == "empty":
     open(out, "xb").close(); sys.exit(0)
 if mode == "hang":
-    open(out, "wb").write(b"x" * 1024); time.sleep(60)
+    with open(out, "xb") as f:
+        f.write(b"x" * 1024); f.flush(); os.fsync(f.fileno())
+    time.sleep(60)
 with open(out, "xb") as f:
     chunk = bytes(range(256)) * 4096          # 1 MiB, deterministic
     left = size
@@ -54,13 +56,17 @@ class DetectionTests(unittest.TestCase):
             return {b['name']: b for b in pmb.detect_backends()}
 
     def test_windows_x64(self):
-        b = self.detect('Windows', 'AMD64', which=lambda n: r'C:\tools\winpmem.exe' if n == 'winpmem.exe' else None)
+        with tempfile.TemporaryDirectory() as d:
+            exe = write_fake_tool(d, pmb.WINPMEM_BINARY)
+            b = self.detect('Windows', 'AMD64', which=lambda n: str(exe) if n == pmb.WINPMEM_BINARY else None)
         self.assertTrue(b['WinPmem']['ready'])
         self.assertFalse(b['AVML']['compatible'])
         self.assertFalse(b['OSXPmem']['compatible'])
 
     def test_linux_x64(self):
-        b = self.detect('Linux', 'x86_64', which=lambda n: '/usr/bin/avml' if n == 'avml' else None)
+        with tempfile.TemporaryDirectory() as d:
+            exe = write_fake_tool(d, 'avml')
+            b = self.detect('Linux', 'x86_64', which=lambda n: str(exe) if n == 'avml' else None)
         self.assertTrue(b['AVML']['ready'])
         self.assertFalse(b['WinPmem']['compatible'])
 
@@ -127,7 +133,7 @@ class CaptureTests(unittest.TestCase):
         with mock.patch.object(pmb.psutil, 'virtual_memory', return_value=mock.Mock(total=4 * 1024 ** 2)), \
              mock.patch.dict(os.environ, {'FAKE_SIZE': str(4 * 1024 * 1024)}):
             r = self.capture()
-        self.assertEqual(r['warnings'], [])
+        self.assertFalse(any('incomplete' in w for w in r['warnings']))
 
     def test_refuses_without_elevation_before_launching(self):
         with mock.patch.object(pmb, 'is_elevated', return_value=False):

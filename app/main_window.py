@@ -13,6 +13,7 @@ from app.tabs.metadata_tab import MetadataTab
 from app.tabs.hex_tab import HexViewTab
 from app.tabs.evidence_explorer_tab import EvidenceExplorerTab
 from app.tabs.memory_capture_tab import MemoryCaptureTab
+from app.tabs.memory_analysis_tab import MemoryAnalysisTab
 from app.tabs.report_tab import ReportTab
 from utils.file_utils import collect_files
 
@@ -54,6 +55,7 @@ class HashToolsWindow(QMainWindow):
         self.report_tab = ReportTab(self._report_state, lambda: self.hash_tab.result_db_path, lambda: getattr(self.hash_tab, "_job_algorithms", self.hash_tab.selected_algorithms()))
         self.evidence_tab = EvidenceExplorerTab()
         self.memory_capture_tab = MemoryCaptureTab()
+        self.memory_analysis_tab = MemoryAnalysisTab()
 
         self.tabs.addTab(self.home_tab, "🏠 Home")
         self.tabs.addTab(self.evidence_tab, "🔎 Evidence Explorer")
@@ -62,6 +64,7 @@ class HashToolsWindow(QMainWindow):
         self.tabs.addTab(self.hex_tab, "🔢 Hex View")
         self.tabs.addTab(self.report_tab, "📄 Report")
         self.tabs.addTab(self.memory_capture_tab, "🧠 Memory Capture")
+        self.tabs.addTab(self.memory_analysis_tab, "🔬 Memory Analysis")
         # Open the explorer by default so the new tab is immediately visible.
         self.tabs.setCurrentWidget(self.evidence_tab)
         self.explorer_shortcut = QShortcut(QKeySequence("Ctrl+E"), self)
@@ -95,6 +98,7 @@ class HashToolsWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         """Qt sends closeEvent only to top-level windows, so shut children down here."""
         self.memory_capture_tab.shutdown()
+        self.memory_analysis_tab.shutdown()
         self.hash_tab.shutdown()
         self.evidence_tab.close()  # stops search worker, clears previews, removes temp data
         super().closeEvent(event)
