@@ -42,7 +42,7 @@ from services.memory_hashing import (
 
 GiB = 1024 ** 3
 MiB = 1024 ** 2
-IMAGE_SUFFIXES = ('.mem', '.raw', '.lime')
+IMAGE_SUFFIXES = ('.mem', '.raw', '.lime', '.aff4')
 # An image far smaller than installed RAM usually means an incomplete acquisition.
 MIN_EXPECTED_FRACTION = 0.5
 # Images are a little larger than RAM on some tools (headers / LiME segment records).
@@ -57,7 +57,7 @@ class UnsupportedCapture(RuntimeError):
 
 
 # The only WinPmem build HashTools runs: the mini x64 executable, invoked as
-# ``winpmem_mini_x64.exe <output>`` (for example ``winpmem_mini_x64.exe physmem.raw``).
+# ``winpmem_mini_x64.exe -o <output.aff4>`` for AFF4 output.
 # Other WinPmem builds and syntaxes (rc2, go-winpmem, legacy ``-o``) are deliberately not run.
 WINPMEM_BINARY = 'winpmem_mini_x64.exe'
 
@@ -67,7 +67,7 @@ TOOLS = {
     'WinPmem': dict(
         binary=WINPMEM_BINARY, binaries=(WINPMEM_BINARY,), patterns=(),
         os='Windows', arch=('amd64', 'x86_64'),
-        args=lambda exe, dest: [exe, dest],          # winpmem_mini_x64.exe <output>
+        args=lambda exe, dest: [exe, '-o', dest],  # AFF4 output; do not pass destination as positional input
         privilege='Administrator',
         ready='Ready (verify build and privileges before acquisition)',
     ),
@@ -420,8 +420,8 @@ def _tool_failure_details(log_path, exit_code):
     except OSError as exc:
         excerpt = f'Unable to read acquisition log: {exc}'
     guidance = (
-        'Check the acquisition log for a driver-load or security-policy error. '
-        'Confirm that the WinPmem build and its signed driver support this Windows '
+        'Check the tool command and supported output format first. '
+        'If driver initialization fails, confirm that the tool and signed driver support this Windows '
         'kernel and security configuration. Do not disable Windows security protections. '
         'If no compatible driver is available, use Live-Response ZIP collection.'
     )
@@ -464,8 +464,10 @@ def capture_memory(tool, executable, output, cancelled=lambda: False, progress=l
         raise FileNotFoundError(str(dest.parent))
     if dest.exists():
         raise FileExistsError(str(dest))
-    if dest.suffix.lower() not in IMAGE_SUFFIXES:
-        raise ValueError('Use a .mem, .raw or .lime filename for this raw acquisition backend')
+    if tool == 'WinPmem' and dest.suffix.lower() != '.aff4':
+        raise ValueError('This WinPmem adapter creates AFF4 evidence: choose a .aff4 filename (not .mem).')
+    if tool == 'AVML' and dest.suffix.lower() not in ('.lime', '.raw'):
+        raise ValueError('AVML produces LiME-format evidence: choose .lime or .raw.')
     paths = sidecar_paths(dest)
     for key, p in paths.items():
         if p.exists():
@@ -546,7 +548,8 @@ def capture_memory(tool, executable, output, cancelled=lambda: False, progress=l
                         f'Review {paths["log"].name} before relying on it.')
     verified, source, verify_seconds = False, 'streamed', 0.0
     try:
-        usable = streamed is not None and tail.valid and tail.done == size == dest.stat().st_size
+        usable = (tool != 'WinPmem' and streamed is not None and tail.valid
+                  and tail.done == size == dest.stat().st_size)  # AFF4 ZIP may rewrite headers
         if usable and verify:
             vt = time.monotonic()
             algo = 'sha256' if 'sha256' in algos else algos[0]

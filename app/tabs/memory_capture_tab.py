@@ -50,7 +50,7 @@ PHASE_LABEL = {'acquire': 'Acquiring', 'hash': 'Hashing', 'verify': 'Verifying'}
 def fresh_evidence_name(physical, folder=None):
     """A new timestamped default name that is not already used in ``folder`` (including sidecars)."""
     stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    stem, ext = ('memory_dump', '.mem') if physical else ('live_response', '.zip')
+    stem, ext = ('memory_dump', '.aff4' if os.name == 'nt' else '.lime') if physical else ('live_response', '.zip')
     candidate, counter = f'{stem}_{stamp}{ext}', 2
     while folder is not None and _name_taken(Path(folder), candidate, physical):
         candidate = f'{stem}_{stamp}_{counter}{ext}'
@@ -93,7 +93,7 @@ class MemoryCaptureTab(QWidget):
         self.examiner.setPlaceholderText('Examiner name')
         form.addRow('Examiner', self.examiner)
         self.mode = QComboBox()
-        self.mode.addItems(['Live-response collection (ZIP)', 'Physical RAM acquisition (.mem)'])
+        self.mode.addItems(['Live-response collection (ZIP)', 'Physical RAM acquisition (AFF4 / LiME)'])
         self.backend = QComboBox()
         self._detected_backends = []
         self.recheck = QPushButton('Re-check tools')
@@ -167,7 +167,7 @@ class MemoryCaptureTab(QWidget):
         verify_group = QGroupBox('Read-only memory image integrity check')
         verify_form = QFormLayout(verify_group)
         self.image = QLineEdit()
-        self.image.setPlaceholderText('Choose a .mem, .raw, .lime, .dmp or .vmem file')
+        self.image.setPlaceholderText('Choose a .aff4, .mem, .raw, .lime, .dmp or .vmem file')
         pick = QPushButton('Select image…')
         pick.clicked.connect(self.choose_image)
         image_row = QHBoxLayout()
@@ -381,7 +381,7 @@ class MemoryCaptureTab(QWidget):
             self.folder.setText(selected)
 
     def choose_image(self):
-        selected, _ = QFileDialog.getOpenFileName(self, 'Select memory image', '', 'Memory images (*.mem *.raw *.lime *.dmp *.vmem);;All files (*)')
+        selected, _ = QFileDialog.getOpenFileName(self, 'Select memory image', '', 'Memory images (*.aff4 *.mem *.raw *.lime *.dmp *.vmem);;All files (*)')
         if selected:
             self.image.setText(selected)
 
@@ -390,7 +390,7 @@ class MemoryCaptureTab(QWidget):
             return
         physical = self.mode.currentIndex() == 1
         name = self.filename.text().strip()
-        extension = IMAGE_SUFFIXES if physical else ('.zip',)
+        extension = (('.aff4',) if os.name == 'nt' else ('.lime', '.raw')) if physical else ('.zip',)
         if not name or name in ('.', '..') or Path(name).name != name or not name.lower().endswith(extension):
             QMessageBox.warning(self, 'Invalid evidence filename', 'Use a simple filename ending in ' + ', '.join(extension))
             return
