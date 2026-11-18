@@ -110,6 +110,15 @@ class MemoryCaptureTab(QWidget):
         form.addRow('Acquisition tool', backend_row)
         self.populate_backends()
         form.addRow('Acquisition method', self.mode)
+        self.output_format = QComboBox()
+        self.output_format.addItem('AFF4 container (.aff4) — WinPmem mini', '.aff4')
+        self.output_format.addItem('Raw memory (.mem) — requires verified raw-capable tool', '.mem')
+        self.output_format.addItem('Raw memory (.ram) — requires verified raw-capable tool', '.ram')
+        self.output_format.addItem('Raw memory (.raw) — requires verified raw-capable tool', '.raw')
+        self.output_format.addItem('LiME image (.lime) — AVML', '.lime')
+        self.output_format.setToolTip('An extension does not convert a memory image. WinPmem mini creates AFF4; AVML creates LiME. Raw output requires a separately validated acquisition adapter.')
+        self.output_format.currentIndexChanged.connect(self._output_format_changed)
+        form.addRow('Physical output format', self.output_format)
         self.folder = QLineEdit(str(Path.home() / 'Documents'))
         browse = QPushButton('Browse…')
         browse.clicked.connect(self.choose_folder)
@@ -167,7 +176,7 @@ class MemoryCaptureTab(QWidget):
         verify_group = QGroupBox('Read-only memory image integrity check')
         verify_form = QFormLayout(verify_group)
         self.image = QLineEdit()
-        self.image.setPlaceholderText('Choose a .aff4, .mem, .raw, .lime, .dmp or .vmem file')
+        self.image.setPlaceholderText('Import .aff4, .mem, .ram, .raw, .lime, .dmp or .vmem evidence')
         pick = QPushButton('Select image…')
         pick.clicked.connect(self.choose_image)
         image_row = QHBoxLayout()
@@ -300,6 +309,10 @@ class MemoryCaptureTab(QWidget):
             self.verify_after.setEnabled(physical and self.job is None)
         # Switching method always proposes a name of the right type, so the extension matches the mode.
         if self._last_physical is not None and physical != self._last_physical:
+            if physical:
+                self.output_format.blockSignals(True)
+                self.output_format.setCurrentIndex(0 if os.name == 'nt' else 4)
+                self.output_format.blockSignals(False)
             self.filename.setText(fresh_evidence_name(physical))
         self._last_physical = physical
         if physical:
@@ -381,9 +394,17 @@ class MemoryCaptureTab(QWidget):
             self.folder.setText(selected)
 
     def choose_image(self):
-        selected, _ = QFileDialog.getOpenFileName(self, 'Select memory image', '', 'Memory images (*.aff4 *.mem *.raw *.lime *.dmp *.vmem);;All files (*)')
+        selected, _ = QFileDialog.getOpenFileName(self, 'Select memory image', '', 'Memory images (*.aff4 *.mem *.ram *.raw *.lime *.dmp *.vmem);;All files (*)')
         if selected:
             self.image.setText(selected)
+
+    def _output_format_changed(self, _index):
+        if self.mode.currentIndex() != 1:
+            return
+        suffix = self.output_format.currentData()
+        if suffix:
+            current = Path(self.filename.text().strip() or 'memory_dump')
+            self.filename.setText(current.stem + suffix)
 
     def capture(self):
         if self.job is not None:
@@ -391,6 +412,15 @@ class MemoryCaptureTab(QWidget):
         physical = self.mode.currentIndex() == 1
         name = self.filename.text().strip()
         extension = (('.aff4',) if os.name == 'nt' else ('.lime', '.raw')) if physical else ('.zip',)
+        if physical:
+            selected_format = self.output_format.currentData()
+            supported_format = '.aff4' if os.name == 'nt' else '.lime'
+            if selected_format != supported_format:
+                QMessageBox.warning(self, 'Output format unavailable',
+                    f'The selected acquisition adapter writes {supported_format}, not {selected_format}. '
+                    'Changing the filename extension does not convert the image. '
+                    'A separately verified raw-capable acquisition tool is required for .mem/.ram/.raw.')
+                return
         if not name or name in ('.', '..') or Path(name).name != name or not name.lower().endswith(extension):
             QMessageBox.warning(self, 'Invalid evidence filename', 'Use a simple filename ending in ' + ', '.join(extension))
             return

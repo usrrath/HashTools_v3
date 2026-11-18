@@ -42,7 +42,7 @@ from services.memory_hashing import (
 
 GiB = 1024 ** 3
 MiB = 1024 ** 2
-IMAGE_SUFFIXES = ('.mem', '.raw', '.lime', '.aff4')
+IMAGE_SUFFIXES = ('.mem', '.ram', '.raw', '.lime', '.aff4', '.dmp', '.vmem')
 # An image far smaller than installed RAM usually means an incomplete acquisition.
 MIN_EXPECTED_FRACTION = 0.5
 # Images are a little larger than RAM on some tools (headers / LiME segment records).
@@ -419,12 +419,26 @@ def _tool_failure_details(log_path, exit_code):
         excerpt = '\n'.join(lines[-12:])
     except OSError as exc:
         excerpt = f'Unable to read acquisition log: {exc}'
-    guidance = (
+    blocked = ('an application control policy has blocked this file' in tail.lower() or
+               'blocked by group policy' in tail.lower() or
+               'blocked by your system administrator' in tail.lower())
+    if blocked:
+        guidance = (
+            'WINDOWS APPLICATION CONTROL BLOCKED THE WINPMEM DRIVER. '
+            'The command reached driver initialization; changing .aff4 to .mem or .ram '
+            'will not resolve this failure. Preserve Windows security settings. '
+            'Ask the organization security administrator to review the Code Integrity / '
+            'App Control event logs and approve a properly signed, compatible acquisition '
+            'tool through the organization\'s authorized policy process, or use Live-Response ZIP. '
+            'No complete physical RAM image was acquired.'
+        )
+    else:
+        guidance = (
         'Check the tool command and supported output format first. '
         'If driver initialization fails, confirm that the tool and signed driver support this Windows '
         'kernel and security configuration. Do not disable Windows security protections. '
         'If no compatible driver is available, use Live-Response ZIP collection.'
-    )
+        )
     return (f'Acquisition tool exited with code {exit_code} (signed {signed}). '
             f'Log: {log_path}\nLast tool output:\n{excerpt or "(no diagnostic output)"}\n{guidance}')
 
@@ -465,7 +479,7 @@ def capture_memory(tool, executable, output, cancelled=lambda: False, progress=l
     if dest.exists():
         raise FileExistsError(str(dest))
     if tool == 'WinPmem' and dest.suffix.lower() != '.aff4':
-        raise ValueError('This WinPmem adapter creates AFF4 evidence: choose a .aff4 filename (not .mem).')
+        raise ValueError('This WinPmem mini adapter writes AFF4 containers only (.aff4). Raw .mem/.ram/.raw requires a separately validated raw-capable acquisition tool; renaming AFF4 would mislabel the evidence.')
     if tool == 'AVML' and dest.suffix.lower() not in ('.lime', '.raw'):
         raise ValueError('AVML produces LiME-format evidence: choose .lime or .raw.')
     paths = sidecar_paths(dest)
