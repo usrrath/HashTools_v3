@@ -4,6 +4,7 @@ import importlib.util
 import os
 import re
 import subprocess
+import tempfile
 import sys
 from pathlib import Path
 
@@ -53,31 +54,47 @@ def command(image, plugin):
         return [sys.executable, str(root / "vol.py"), "-f", str(image), "-r", "json", plugin]
     return [sys.executable, "-m", "volatility3", "-f", str(image), "-r", "json", plugin]
 
+def plugin_dependencies():
+    """Report optional modules without disabling the entire analysis interface."""
+    checks = {"pefile": "pefile", "YARA scanning": "yara_x", "Windows credential plugins": "Crypto"}
+    return {label: importlib.util.find_spec(module) is not None for label, module in checks.items()}
+
+
 def run_plugin(image, plugin, timeout=900, cancelled=None):
+    """Execute with disk-backed streams to avoid PIPE deadlocks on large output."""
+    import time
     cmd = command(image, plugin)
     env = os.environ.copy()
     root = _source_root()
     if root:
         env["PYTHONPATH"] = str(root) + os.pathsep + env.get("PYTHONPATH", "")
-    import time
-    start = time.monotonic()
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
-    try:
-        while proc.poll() is None:
-            if cancelled is not None and cancelled():
-                proc.terminate()
-                try: proc.wait(timeout=3)
-                except subprocess.TimeoutExpired: proc.kill()
-                raise AnalysisUnavailable("Analysis cancelled by examiner")
-            if time.monotonic() - start > timeout:
+    with tempfile.TemporaryFile(mode="w+b") as out, tempfile.TemporaryFile(mode="w+b") as err:
+        proc = subprocess.Popen(cmd, stdout=out, stderr=err, env=env, stdin=subprocess.DEVNULL)
+        start = time.monotonic()
+        try:
+            while proc.poll() is None:
+                if cancelled is not None and cancelled():
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                    raise AnalysisUnavailable("Analysis cancelled by examiner")
+                if time.monotonic() - start > timeout:
+                    proc.kill()
+                    proc.wait()
+                    raise AnalysisUnavailable(f"Analysis timed out after {timeout} seconds")
+                time.sleep(0.15)
+            out.seek(0)
+            err.seek(0)
+            if proc.returncode:
+                details = err.read().decode("utf-8", "replace")[-5000:]
+                if not details:
+                    details = out.read().decode("utf-8", "replace")[-5000:]
+                raise AnalysisUnavailable(details or f"Volatility exited with code {proc.returncode}")
+            return out.read().decode("utf-8", "replace")
+        finally:
+            if proc.poll() is None:
                 proc.kill()
-                raise AnalysisUnavailable(f"Analysis timed out after {timeout} seconds")
-            time.sleep(0.15)
-        stdout, stderr = proc.communicate(timeout=10)
-        if proc.returncode:
-            raise AnalysisUnavailable((stderr or stdout).decode("utf-8", "replace")[-5000:])
-        return stdout.decode("utf-8", "replace")
-    finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait()
+                proc.wait()

@@ -7,7 +7,7 @@ from pathlib import Path
 from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtWidgets import (QWidget,QVBoxLayout,QHBoxLayout,QLabel,QLineEdit,QPushButton,
     QFileDialog,QComboBox,QPlainTextEdit,QMessageBox)
-from services.memory.volatility_adapter import PLUGINS, availability, run_plugin
+from services.memory.volatility_adapter import PLUGINS, availability, run_plugin, plugin_dependencies
 
 class VolatilityWorker(QThread):
     completed = pyqtSignal(object)
@@ -65,7 +65,8 @@ class VolatilityCapturePanel(QWidget):
         self.refresh()
     def refresh(self):
         ok, reason = availability()
-        self.status.setText(reason)
+        missing = [name for name, installed in plugin_dependencies().items() if not installed]
+        self.status.setText(reason + (" | Optional modules missing: " + ", ".join(missing) if missing else ""))
         self.run_button.setEnabled(ok and not (self.worker and self.worker.isRunning()))
     def browse(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select memory image", "", "Memory images (*.raw *.mem *.ram *.dmp *.vmem *.lime *.aff4);;All files (*)")
