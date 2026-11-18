@@ -404,6 +404,31 @@ def _record_outcome(paths, base, status, error):
         pass   # never mask the original failure
 
 
+def _tool_failure_details(log_path, exit_code):
+    """Explain external acquisition failures without guessing driver-specific causes."""
+    signed = exit_code
+    if os.name == 'nt' and isinstance(exit_code, int):
+        signed = ((exit_code + 2**31) % 2**32) - 2**31
+    try:
+        # Read only the last 64 KiB: tool logs can be very large.
+        with open(log_path, 'rb') as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - 65536))
+            tail = handle.read().decode('utf-8', errors='replace')
+        lines = [line.strip() for line in tail.splitlines() if line.strip()]
+        excerpt = '\n'.join(lines[-12:])
+    except OSError as exc:
+        excerpt = f'Unable to read acquisition log: {exc}'
+    guidance = (
+        'Check the acquisition log for a driver-load or security-policy error. '
+        'Confirm that the WinPmem build and its signed driver support this Windows '
+        'kernel and security configuration. Do not disable Windows security protections. '
+        'If no compatible driver is available, use Live-Response ZIP collection.'
+    )
+    return (f'Acquisition tool exited with code {exit_code} (signed {signed}). '
+            f'Log: {log_path}\nLast tool output:\n{excerpt or "(no diagnostic output)"}\n{guidance}')
+
+
 def capture_memory(tool, executable, output, cancelled=lambda: False, progress=lambda msg: None,
                    case_id=None, examiner=None, *, algorithms=('md5', 'sha1', 'sha256'),
                    verify=True, report=None):
@@ -487,8 +512,7 @@ def capture_memory(tool, executable, output, cancelled=lambda: False, progress=l
                     _terminate(proc)
         acquisition_seconds = time.monotonic() - started
         if proc.returncode != 0:
-            raise RuntimeError(f'{tool} exited with code {proc.returncode}. Inspect {paths["log"]}; '
-                               'any partial output was retained.')
+            raise RuntimeError(_tool_failure_details(paths['log'], proc.returncode) + '\nAny partial output was retained.')
         if not dest.is_file() or dest.stat().st_size == 0:
             raise RuntimeError('Acquisition returned success but no nonempty memory image was produced')
         size = dest.stat().st_size
